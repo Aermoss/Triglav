@@ -1,0 +1,994 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Memory.zir", "src/Strings.zir", "src/Trap.zir", "src/Process.zir", "src/SD.zir", "src/Clock.zir" : *]
+
+const SECTOR_SIZE: u32 = 512;
+const ENTRY_SIZE: u32 = 32;
+const ENTRIES_PER_SECTOR: u32 = 16;
+const FAT_ENTRIES_PER_SECTOR: u32 = 128;
+const FILE_NAME_LENGTH: u32 = 256;
+const MAX_PATH: u32 = 256;
+const MAX_NAME_UNITS: u32 = 255;
+const MAX_RUN_SECTORS: u32 = 128;
+const FILE_CONTIGUOUS: u32 = 1;
+const ATTRIBUTE_VOLUME: u32 = 0x08;
+const ATTRIBUTE_FOLDER: u32 = 0x10;
+const ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const ATTRIBUTE_LONG_NAME: u32 = 0x0F;
+const FREE_CLUSTER: u32 = 0;
+const UNKNOWN_COUNT: u32 = 0xFFFFFFFF;
+const NO_SECTOR: u32 = 0xFFFFFFFF;
+
+const FILE_OK: u32 = 0;
+const FILE_NO_FILE_SYSTEM: u32 = 1;
+const FILE_NOT_FOUND: u32 = 2;
+const FILE_BAD_NAME: u32 = 3;
+const FILE_NO_SHORT_NAME: u32 = 4;
+const FILE_NO_SPACE: u32 = 5;
+const FILE_IO_ERROR: u32 = 6;
+const FILE_NOT_FOLDER: u32 = 7;
+const FILE_IS_FOLDER: u32 = 8;
+const FILE_NOT_EMPTY: u32 = 9;
+const FILE_EXISTS: u32 = 10;
+const FILE_INTO_ITSELF: u32 = 11;
+const FILE_NO_MEMORY: u32 = 12;
+const FILE_BAD_HANDLE: u32 = 13;
+const FILE_BUSY: u32 = 14;
+const FILE_NOT_ALLOWED: u32 = 15;
+const FILE_TOO_MANY: u32 = 16;
+const FILE_BAD_POSITION: u32 = 17;
+const FILE_NOT_EXECUTABLE: u32 = 18;
+const FILE_NO_PROCESS: u32 = 19;
+const FILE_CRASHED: u32 = 20;
+const FILE_KILLED: u32 = 21;
+const FILE_TOO_LONG: u32 = 22;
+
+struct FileInfo {
+    pub name: [i8; 256],
+    pub size: u32,
+    pub first_cluster: u32,
+    pub attributes: u32,
+    pub entry_cluster: u32,
+    pub entry_index: u32,
+    pub start_cluster: u32,
+    pub start_index: u32,
+    pub flags: u32,
+    pub data_length: u32,
+    pub entry_count: u32,
+    pub parent_contiguous: u32,
+    pub cursor_index: u32,
+    pub cursor_cluster: u32
+}
+
+struct Cursor {
+    pub cluster: u32,
+    pub index: u32,
+    pub contiguous: bool,
+    pub remaining: u32
+}
+
+struct VolumeOperations {
+    pub name: *i8,
+    pub next_file: fn(*mut Cursor, *mut FileInfo) -> u32,
+    pub create_entry: fn(*mut FileInfo, *i8, u32, u32, u32, u32, u32, *mut FileInfo) -> u32,
+    pub delete_entry: fn(*FileInfo) -> u32,
+    pub update_entry: fn(*FileInfo, u32, u32) -> u32,
+    pub is_free_entry: fn(*u8) -> bool,
+    pub grow_folder: fn(*mut FileInfo, u32) -> u32,
+    pub is_cluster_free: fn(u32) -> bool,
+    pub set_cluster_used: fn(u32, bool) -> bool,
+    pub prepare_folder: fn(u32, *FileInfo) -> bool,
+    pub set_parent: fn(*FileInfo, u32) -> u32,
+    pub flush: fn() -> bool
+}
+
+static mut operations: *VolumeOperations = null;
+static mut chain_end: u32 = 0x0FFFFFFF;
+static mut fat_mask: u32 = 0x0FFFFFFF;
+static mut upcase_loaded: bool = false;
+static mut io_failed: bool = false;
+static mut volume_start: u32 = 0;
+static mut fat_start: u32 = 0;
+static mut fat_sectors: u32 = 0;
+static mut fat_copies: u32 = 0;
+static mut cluster_sectors: u32 = 0;
+static mut cluster_bytes: u32 = 0;
+static mut data_start: u32 = 0;
+static mut cluster_count: u32 = 0;
+static mut root_cluster: u32 = 0;
+static mut free_clusters: u32 = 0xFFFFFFFF;
+static mut next_free: u32 = 2;
+static mut sector_buffer: [u8; 512];
+static mut cached_sector: u32 = 0xFFFFFFFF;
+static mut sector_dirty: bool = false;
+static mut fat_buffer: [u8; 512];
+static mut cached_fat_sector: u32 = 0xFFFFFFFF;
+static mut fat_dirty: bool = false;
+static mut data_buffer: [u8; 512];
+static mut upcase_table: *mut u16 = null;
+static mut long_units: [u16; 260];
+static mut short_display: [i8; 16];
+
+fn StringLength(mut text: *i8) -> u32 {
+    let mut length: u32 = 0;
+
+    while *text != '\0' {
+        text += 1;
+        length += 1;
+    }
+
+    length
+}
+
+fn CopyText(destination: *mut i8, source: *i8, capacity: u32) -> bool {
+    let mut i: u32 = 0;
+
+    while source[i as usize] != '\0' {
+        if i + 1 >= capacity {
+            destination[0] = '\0';
+            return false;
+        }
+
+        destination[i as usize] = source[i as usize];
+        i += 1;
+    }
+
+    destination[i as usize] = '\0';
+    true
+}
+
+fn LowerCharacter(value: i8) -> i8 {
+    if value >= 'A' && value <= 'Z' { value + 32 } else { value }
+}
+
+fn NextCode(text: *i8, index: *mut usize) -> u32 {
+    let bytes = text as *u8;
+    let first = bytes[*index] as u32;
+    let (mut code, mut extra): (u32, usize) = (first, 0);
+
+    if first >= 0xF0 && first < 0xF8 {
+        (code, extra) = (first & 0x07, 3);
+    } else if first >= 0xE0 && first < 0xF0 {
+        (code, extra) = (first & 0x0F, 2);
+    } else if first >= 0xC0 && first < 0xE0 {
+        (code, extra) = (first & 0x1F, 1);
+    }
+
+    let mut k: usize = 1;
+
+    while k <= extra {
+        let next = bytes[*index + k] as u32;
+
+        if (next & 0xC0) != 0x80 {
+            *index += 1;
+            return first;
+        }
+
+        code = (code << 6) | (next & 0x3F);
+        k += 1;
+    }
+
+    *index += extra + 1;
+    if code > 0xFFFF { code } else { Upcase(code) }
+}
+
+fn SameName(left: *i8, right: *i8) -> bool {
+    let (mut i, mut j): (usize, usize) = (0, 0);
+
+    loop {
+        if left[i] == '\0' || right[j] == '\0' {
+            return left[i] == right[j];
+        }
+
+        if NextCode(left, &mut i) != NextCode(right, &mut j) {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn GetHalf(data: *u8) -> u32 {
+    data[0] as u32 | (data[1] as u32 << 8)
+}
+
+fn GetWord(data: *u8) -> u32 {
+    GetHalf(data) | (GetHalf(data + 2) << 16)
+}
+
+fn PutHalf(data: *mut u8, value: u32) {
+    data[0] = (value & 0xFF) as u8;
+    data[1] = ((value >> 8) & 0xFF) as u8;
+}
+
+fn PutWord(data: *mut u8, value: u32) {
+    PutHalf(data, value & 0xFFFF);
+    PutHalf(data + 2, value >> 16);
+}
+
+fn FileName(info: *FileInfo) -> *i8 {
+    &info->name[0] as *i8
+}
+
+fn IsFolder(info: *FileInfo) -> bool {
+    (info->attributes & ATTRIBUTE_FOLDER) != 0
+}
+
+fn ClusterSector(cluster: u32) -> u32 {
+    data_start + (cluster - 2) * cluster_sectors
+}
+
+fn IsValidCluster(cluster: u32) -> bool {
+    cluster >= 2 && cluster < cluster_count + 2
+}
+
+fn IsChainEnd(value: u32) -> bool {
+    value < 2 || value >= cluster_count + 2
+}
+
+fn ChainEnd() -> u32 {
+    chain_end
+}
+
+fn FlushSector() -> bool {
+    if sector_dirty {
+        if !SDWriteSectors(cached_sector, 1, &sector_buffer[0] as *u8) {
+            io_failed = true;
+            return false;
+        }
+
+        sector_dirty = false;
+    }
+
+    true
+}
+
+fn LoadSector(sector: u32) -> *mut u8 {
+    if cached_sector != sector {
+        if !FlushSector() {
+            return null;
+        }
+
+        if !SDReadSectors(sector, 1, &mut sector_buffer[0]) {
+            cached_sector = NO_SECTOR;
+            io_failed = true;
+            return null;
+        }
+
+        cached_sector = sector;
+    }
+
+    &mut sector_buffer[0]
+}
+
+fn ForgetSectors(first: u32, count: u32) {
+    if cached_sector != NO_SECTOR && cached_sector >= first && cached_sector - first < count {
+        (cached_sector, sector_dirty) = (NO_SECTOR, false);
+    }
+}
+
+fn FlushFat() -> bool {
+    if fat_dirty {
+        let mut copy: u32 = 0;
+
+        while copy < fat_copies {
+            if !SDWriteSectors(cached_fat_sector + copy * fat_sectors, 1, &fat_buffer[0] as *u8) {
+                io_failed = true;
+                return false;
+            }
+
+            copy += 1;
+        }
+
+        fat_dirty = false;
+    }
+
+    true
+}
+
+fn LoadFat(cluster: u32) -> bool {
+    let sector = fat_start + cluster / FAT_ENTRIES_PER_SECTOR;
+
+    if cached_fat_sector != sector {
+        if !FlushFat() {
+            return false;
+        }
+
+        if !SDReadSectors(sector, 1, &mut fat_buffer[0]) {
+            cached_fat_sector = NO_SECTOR;
+            io_failed = true;
+            return false;
+        }
+
+        cached_fat_sector = sector;
+    }
+
+    true
+}
+
+fn ReadFat(cluster: u32) -> u32 {
+    if !IsValidCluster(cluster) || !LoadFat(cluster) {
+        return END_OF_CHAIN;
+    }
+
+    let value = GetWord(&fat_buffer[((cluster % FAT_ENTRIES_PER_SECTOR) * 4) as usize] as *u8);
+    value & fat_mask
+}
+
+fn WriteFat(cluster: u32, value: u32) -> bool {
+    if !IsValidCluster(cluster) || !LoadFat(cluster) {
+        return false;
+    }
+
+    let entry = &mut fat_buffer[((cluster % FAT_ENTRIES_PER_SECTOR) * 4) as usize] as *mut u8;
+    PutWord(entry, (GetWord(entry as *u8) & !fat_mask) | (value & fat_mask));
+    fat_dirty = true;
+    true
+}
+
+fn FlushAll() -> bool {
+    (operations == null || operations->flush()) && FlushFat() && FlushSector()
+}
+
+fn IsClusterFree(cluster: u32) -> bool {
+    operations->is_cluster_free(cluster)
+}
+
+fn CountFreeClusters() -> u32 {
+    let mut count: u32 = 0;
+    let mut cluster: u32 = 2;
+
+    while cluster < cluster_count + 2 && !io_failed {
+        if IsClusterFree(cluster) && !io_failed {
+            count += 1;
+        }
+
+        cluster += 1;
+    }
+
+    count
+}
+
+fn FindFreeCluster() -> u32 {
+    if free_clusters == 0 {
+        return 0;
+    }
+
+    let mut cluster = if IsValidCluster(next_free) { next_free } else { 2 };
+    let mut checked: u32 = 0;
+
+    while checked < cluster_count && !io_failed {
+        if IsClusterFree(cluster) && !io_failed {
+            return cluster;
+        }
+
+        cluster += 1;
+
+        if cluster >= cluster_count + 2 {
+            cluster = 2;
+        }
+
+        checked += 1;
+    }
+
+    0
+}
+
+fn ZeroCluster(cluster: u32) -> bool {
+    let mut i: usize = 0;
+
+    while i < SECTOR_SIZE as usize {
+        data_buffer[i] = 0;
+        i += 1;
+    }
+
+    let first = ClusterSector(cluster);
+    ForgetSectors(first, cluster_sectors);
+    let mut sector: u32 = 0;
+
+    while sector < cluster_sectors {
+        if !SDWriteSectors(first + sector, 1, &data_buffer[0] as *u8) {
+            io_failed = true;
+            return false;
+        }
+
+        sector += 1;
+    }
+
+    true
+}
+
+fn AllocateCluster(previous: u32, zero: bool) -> u32 {
+    let cluster = FindFreeCluster();
+
+    if cluster == 0 || !operations->set_cluster_used(cluster, true) || !WriteFat(cluster, ChainEnd()) {
+        return 0;
+    }
+
+    if previous != 0 && !WriteFat(previous, cluster) {
+        return 0;
+    }
+
+    if free_clusters != UNKNOWN_COUNT {
+        free_clusters -= 1;
+    }
+
+    (next_free, information_dirty) = (cluster + 1, true);
+
+    if zero && !ZeroCluster(cluster) {
+        return 0;
+    }
+
+    cluster
+}
+
+fn FreeChain(first: u32) -> bool {
+    let mut cluster = first;
+    let mut guard: u32 = 0;
+
+    while !IsChainEnd(cluster) && guard <= cluster_count {
+        let next = ReadFat(cluster);
+
+        if !operations->set_cluster_used(cluster, false) {
+            return false;
+        }
+
+        if free_clusters != UNKNOWN_COUNT {
+            free_clusters += 1;
+        }
+
+        if cluster < next_free {
+            next_free = cluster;
+        }
+
+        ForgetSectors(ClusterSector(cluster), cluster_sectors);
+        cluster = next;
+        guard += 1;
+    }
+
+    information_dirty = true;
+    true
+}
+
+fn ReleaseClusters(first: u32, flags: u32, length: u32) -> bool {
+    if first == 0 {
+        return true;
+    }
+
+    if (flags & FILE_CONTIGUOUS) == 0 {
+        return FreeChain(first);
+    }
+
+    let count = (length + cluster_bytes - 1) / cluster_bytes;
+    let mut k: u32 = 0;
+
+    while k < count {
+        let cluster = first + k;
+
+        if !IsValidCluster(cluster) || !operations->set_cluster_used(cluster, false) {
+            return false;
+        }
+
+        if free_clusters != UNKNOWN_COUNT {
+            free_clusters += 1;
+        }
+
+        if cluster < next_free {
+            next_free = cluster;
+        }
+
+        ForgetSectors(ClusterSector(cluster), cluster_sectors);
+        k += 1;
+    }
+
+    true
+}
+
+fn DefaultUpcase(value: u32) -> u32 {
+    if (value >= 0x61 && value <= 0x7A) || (value >= 0xE0 && value <= 0xFE && value != 0xF7) {
+        value - 0x20
+    } else if value == 0xFF {
+        0x178
+    } else if (value >= 0x100 && value <= 0x12F) || (value >= 0x132 && value <= 0x137) || (value >= 0x14A && value <= 0x177) {
+        value & 0xFFFE
+    } else if ((value >= 0x139 && value <= 0x148) || (value >= 0x179 && value <= 0x17E)) && (value & 1) == 0 {
+        value - 1
+    } else {
+        value
+    }
+}
+
+fn Upcase(value: u32) -> u32 {
+    if upcase_loaded && upcase_table != null { upcase_table[value as usize] as u32 } else { DefaultUpcase(value) }
+}
+
+fn EntriesPerCluster() -> u32 {
+    cluster_bytes / ENTRY_SIZE
+}
+
+fn MakeCursor(cluster: u32, index: u32) -> Cursor {
+    Cursor { cluster: cluster, index: index, contiguous: false, remaining: 0 }
+}
+
+fn FolderCursor(folder: *FileInfo) -> Cursor {
+    let contiguous = (folder->flags & FILE_CONTIGUOUS) != 0;
+    Cursor { cluster: FolderCluster(folder), index: 0, contiguous: contiguous, remaining: if contiguous { folder->data_length / cluster_bytes } else { 0 } }
+}
+
+fn EntryCursor(info: *FileInfo, cluster: u32, index: u32) -> Cursor {
+    Cursor { cluster: cluster, index: index, contiguous: info->parent_contiguous != 0, remaining: 0xFFFFFFFF }
+}
+
+fn EntryPointer(cursor: *Cursor) -> *mut u8 {
+    let sector = LoadSector(ClusterSector(cursor->cluster) + cursor->index / ENTRIES_PER_SECTOR);
+    if sector == null { null } else { sector + ((cursor->index % ENTRIES_PER_SECTOR) * ENTRY_SIZE) as usize }
+}
+
+fn Advance(cursor: *mut Cursor) -> bool {
+    cursor->index += 1;
+
+    if cursor->index == EntriesPerCluster() {
+        if cursor->contiguous {
+            if cursor->remaining <= 1 {
+                cursor->cluster = 0;
+                return false;
+            }
+
+            (cursor->cluster, cursor->index, cursor->remaining) = (cursor->cluster + 1, 0, cursor->remaining - 1);
+            return true;
+        }
+
+        let next = ReadFat(cursor->cluster);
+
+        if IsChainEnd(next) {
+            cursor->cluster = 0;
+            return false;
+        }
+
+        (cursor->cluster, cursor->index) = (next, 0);
+    }
+
+    true
+}
+
+fn LongNameToText(count: u32, name: *mut i8) -> bool {
+    let mut length: u32 = 0;
+    let mut i: u32 = 0;
+
+    while i < count && long_units[i as usize] != 0 {
+        let mut code = long_units[i as usize] as u32;
+
+        if code >= 0xD800 && code < 0xDC00 && i + 1 < count {
+            let low = long_units[(i + 1) as usize] as u32;
+
+            if low >= 0xDC00 && low < 0xE000 {
+                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                i += 1;
+            }
+        }
+
+        let bytes: u32 = if code < 0x80 { 1 } else if code < 0x800 { 2 } else if code < 0x10000 { 3 } else { 4 };
+
+        if length + bytes >= FILE_NAME_LENGTH {
+            return false;
+        }
+
+        if bytes == 1 {
+            name[length as usize] = code as i8;
+        } else if bytes == 2 {
+            name[length as usize] = (0xC0 | (code >> 6)) as u8 as i8;
+            name[(length + 1) as usize] = (0x80 | (code & 0x3F)) as u8 as i8;
+        } else if bytes == 3 {
+            name[length as usize] = (0xE0 | (code >> 12)) as u8 as i8;
+            name[(length + 1) as usize] = (0x80 | ((code >> 6) & 0x3F)) as u8 as i8;
+            name[(length + 2) as usize] = (0x80 | (code & 0x3F)) as u8 as i8;
+        } else {
+            name[length as usize] = (0xF0 | (code >> 18)) as u8 as i8;
+            name[(length + 1) as usize] = (0x80 | ((code >> 12) & 0x3F)) as u8 as i8;
+            name[(length + 2) as usize] = (0x80 | ((code >> 6) & 0x3F)) as u8 as i8;
+            name[(length + 3) as usize] = (0x80 | (code & 0x3F)) as u8 as i8;
+        }
+
+        length += bytes;
+        i += 1;
+    }
+
+    name[length as usize] = '\0';
+    length > 0
+}
+
+fn TextToLongName(name: *i8) -> u32 {
+    TextToUnits(name, &mut long_units[0])
+}
+
+fn TextToUnits(name: *i8, units: *mut u16) -> u32 {
+    let bytes = name as *u8;
+    let mut count: u32 = 0;
+    let mut i: usize = 0;
+
+    while bytes[i] != 0 {
+        let first = bytes[i] as u32;
+        let (mut code, mut extra): (u32, usize) = (first, 0);
+
+        if first >= 0xF0 && first < 0xF8 {
+            (code, extra) = (first & 0x07, 3);
+        } else if first >= 0xE0 && first < 0xF0 {
+            (code, extra) = (first & 0x0F, 2);
+        } else if first >= 0xC0 && first < 0xE0 {
+            (code, extra) = (first & 0x1F, 1);
+        }
+
+        let mut valid = true;
+        let mut k: usize = 1;
+
+        while valid && k <= extra {
+            let next = bytes[i + k] as u32;
+            valid = (next & 0xC0) == 0x80;
+            code = (code << 6) | (next & 0x3F);
+            k += 1;
+        }
+
+        if !valid {
+            (code, extra) = (first, 0);
+        }
+
+        if count + (if code >= 0x10000 { 2 } else { 1 }) > MAX_NAME_UNITS {
+            return MAX_NAME_UNITS + 1;
+        }
+
+        if code >= 0x10000 {
+            code -= 0x10000;
+            units[count as usize] = (0xD800 + (code >> 10)) as u16;
+            units[(count + 1) as usize] = (0xDC00 + (code & 0x3FF)) as u16;
+            count += 2;
+        } else {
+            units[count as usize] = code as u16;
+            count += 1;
+        }
+
+        i += extra + 1;
+    }
+
+    count
+}
+
+fn NextFile(cursor: *mut Cursor, info: *mut FileInfo) -> u32 {
+    operations->next_file(cursor, info)
+}
+
+fn RootInfo(info: *mut FileInfo) {
+    info->name[0] = '\0';
+    (info->size, info->first_cluster, info->attributes) = (0, root_cluster, ATTRIBUTE_FOLDER);
+    (info->entry_cluster, info->entry_index, info->start_cluster, info->start_index) = (0, 0, 0, 0);
+    (info->flags, info->data_length, info->entry_count, info->parent_contiguous) = (0, 0, 0, 0);
+    (info->cursor_index, info->cursor_cluster) = (0, root_cluster);
+}
+
+fn FolderCluster(folder: *FileInfo) -> u32 {
+    if folder->first_cluster == 0 { root_cluster } else { folder->first_cluster }
+}
+
+fn IsValidName(name: *i8) -> bool {
+    let bytes = name as *u8;
+    let length = StringLength(name);
+
+    if length == 0 || length >= FILE_NAME_LENGTH || SameName(name, ".") || SameName(name, "..") {
+        return false;
+    }
+
+    let last = bytes[(length - 1) as usize];
+
+    if last == ('.' as u8) || last == (' ' as u8) {
+        return false;
+    }
+
+    let mut i: u32 = 0;
+
+    while i < length {
+        let value = bytes[i as usize];
+
+        if value < 0x20 || value == ('/' as u8) || value == ('\\' as u8) || value == (':' as u8) || value == ('*' as u8) || value == ('?' as u8) ||
+            value == ('"' as u8) || value == ('<' as u8) || value == ('>' as u8) || value == ('|' as u8) {
+            return false;
+        }
+
+        i += 1;
+    }
+
+    TextToLongName(name) <= MAX_NAME_UNITS
+}
+
+fn FindFreeEntries(folder: *mut FileInfo, needed: u32, start: *mut Cursor) -> bool {
+    let mut cursor = FolderCursor(folder as *FileInfo);
+    let mut last = cursor.cluster;
+    let mut run: u32 = 0;
+
+    loop {
+        if cursor.cluster == 0 {
+            let cluster = operations->grow_folder(folder, last);
+
+            if cluster == 0 {
+                return false;
+            }
+
+            cursor = MakeCursor(cluster, 0);
+            start->contiguous = false;
+        }
+
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return false;
+        }
+
+        if operations->is_free_entry(entry as *u8) {
+            if run == 0 {
+                (start->cluster, start->index, start->contiguous, start->remaining) = (cursor.cluster, cursor.index, cursor.contiguous, 0xFFFFFFFF);
+            }
+
+            run += 1;
+
+            if run == needed {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+
+        last = cursor.cluster;
+        Advance(&mut cursor);
+
+        if io_failed {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn FatTimestamp() -> u32 {
+    if !clock_valid {
+        return (((2026 - 1980) << 9) | (1 << 5) | 1) << 16;
+    }
+
+    let zone_seconds = (if clock_zone < 0 { 0 - clock_zone } else { clock_zone }) as u32 * 3600;
+    let now = ClockNow();
+    let local = if clock_zone < 0 { now - zone_seconds } else { now + zone_seconds };
+    let days = local / 86400;
+    let rest = local % 86400;
+    let shifted = days + 719468;
+    let era = shifted / 146097;
+    let day_of_era = shifted - era * 146097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let year = year_of_era + era * 400 + (if month <= 2 { 1 } else { 0 });
+    let date = ((if year < 1980 { 0 } else { year - 1980 }) << 9) | (month << 5) | day;
+    let time = ((rest / 3600) << 11) | ((rest / 60 % 60) << 5) | (rest % 60 / 2);
+    (date << 16) | time
+}
+
+fn CreateEntry(folder: *mut FileInfo, name: *i8, attributes: u32, cluster: u32, size: u32, flags: u32, length: u32, info: *mut FileInfo) -> u32 {
+    operations->create_entry(folder, name, attributes, cluster, size, flags, length, info)
+}
+
+fn DeleteEntry(info: *FileInfo) -> u32 {
+    operations->delete_entry(info)
+}
+
+fn UpdateEntry(info: *FileInfo, cluster: u32, size: u32) -> u32 {
+    operations->update_entry(info, cluster, size)
+}
+
+fn ClusterAt(info: *mut FileInfo, index: u32) -> u32 {
+    if !IsValidCluster(info->first_cluster) {
+        return 0;
+    }
+
+    if (info->flags & FILE_CONTIGUOUS) != 0 {
+        return if index < (info->data_length + cluster_bytes - 1) / cluster_bytes { info->first_cluster + index } else { 0 };
+    }
+
+    let (mut i, mut cluster) = if IsValidCluster(info->cursor_cluster) && info->cursor_index <= index {
+        (info->cursor_index, info->cursor_cluster)
+    } else {
+        (0u32, info->first_cluster)
+    };
+
+    while i < index {
+        cluster = ReadFat(cluster);
+
+        if IsChainEnd(cluster) {
+            return 0;
+        }
+
+        i += 1;
+    }
+
+    (info->cursor_index, info->cursor_cluster) = (i, cluster);
+    cluster
+}
+
+fn ReadData(info: *mut FileInfo, offset: u32, buffer: *mut u8, count: u32) -> u32 {
+    if offset >= info->size {
+        return 0;
+    }
+
+    let length = if count < info->size - offset { count } else { info->size - offset };
+    let mut done: u32 = 0;
+
+    while done < length {
+        let position = offset + done;
+        let index = position / cluster_bytes;
+        let cluster = ClusterAt(info, index);
+
+        if cluster == 0 {
+            break;
+        }
+
+        let within = position % cluster_bytes;
+        let first_sector = ClusterSector(cluster) + within / SECTOR_SIZE;
+        let byte = within % SECTOR_SIZE;
+        let remaining = length - done;
+
+        if byte == 0 && remaining >= SECTOR_SIZE {
+            let wanted = remaining / SECTOR_SIZE;
+            let mut sectors = cluster_sectors - within / SECTOR_SIZE;
+            let (mut last, mut last_index) = (cluster, index);
+
+            while sectors < wanted && sectors < MAX_RUN_SECTORS {
+                let next = if (info->flags & FILE_CONTIGUOUS) != 0 { last + 1 } else { ReadFat(last) };
+
+                if next != last + 1 {
+                    break;
+                }
+
+                (last, last_index) = (next, last_index + 1);
+                sectors += cluster_sectors;
+            }
+
+            if sectors > wanted {
+                sectors = wanted;
+            }
+
+            if !SDReadSectors(first_sector, sectors, buffer + done as usize) {
+                io_failed = true;
+                break;
+            }
+
+            (info->cursor_index, info->cursor_cluster) = (last_index, last);
+            done += sectors * SECTOR_SIZE;
+        } else {
+            if !SDReadSectors(first_sector, 1, &mut data_buffer[0]) {
+                io_failed = true;
+                break;
+            }
+
+            let mut take = SECTOR_SIZE - byte;
+
+            if take > remaining {
+                take = remaining;
+            }
+
+            let mut i: u32 = 0;
+
+            while i < take {
+                buffer[(done + i) as usize] = data_buffer[(byte + i) as usize];
+                i += 1;
+            }
+
+            done += take;
+        }
+    }
+
+    done
+}
+
+fn WriteChain(data: *u8, size: u32, first: *mut u32) -> u32 {
+    *first = 0;
+
+    if size == 0 {
+        return FILE_OK;
+    }
+
+    let count = (size + cluster_bytes - 1) / cluster_bytes;
+
+    if free_clusters != UNKNOWN_COUNT && free_clusters < count {
+        return FILE_NO_SPACE;
+    }
+
+    let mut previous: u32 = 0;
+    let mut k: u32 = 0;
+
+    while k < count {
+        let cluster = AllocateCluster(previous, false);
+
+        if cluster == 0 {
+            if *first != 0 {
+                FreeChain(*first);
+                *first = 0;
+            }
+
+            return if io_failed { FILE_IO_ERROR } else { FILE_NO_SPACE };
+        }
+
+        if previous == 0 {
+            *first = cluster;
+        }
+
+        previous = cluster;
+        k += 1;
+    }
+
+    let mut written: u32 = 0;
+    let mut cluster = *first;
+
+    while written < size && !IsChainEnd(cluster) {
+        let remaining = size - written;
+        let mut sectors = cluster_sectors;
+        let mut last = cluster;
+
+        while sectors * SECTOR_SIZE < remaining && sectors < MAX_RUN_SECTORS {
+            let next = ReadFat(last);
+
+            if next != last + 1 {
+                break;
+            }
+
+            last = next;
+            sectors += cluster_sectors;
+        }
+
+        let whole = if remaining / SECTOR_SIZE < sectors { remaining / SECTOR_SIZE } else { sectors };
+        let sector = ClusterSector(cluster);
+        ForgetSectors(sector, sectors);
+
+        if whole > 0 && !SDWriteSectors(sector, whole, data + written as usize) {
+            io_failed = true;
+            return FILE_IO_ERROR;
+        }
+
+        written += whole * SECTOR_SIZE;
+
+        if whole < sectors && written < size {
+            let tail = size - written;
+            let mut i: u32 = 0;
+
+            while i < SECTOR_SIZE {
+                data_buffer[i as usize] = if i < tail { data[(written + i) as usize] } else { 0 };
+                i += 1;
+            }
+
+            if !SDWriteSectors(sector + whole, 1, &data_buffer[0] as *u8) {
+                io_failed = true;
+                return FILE_IO_ERROR;
+            }
+
+            written = size;
+        }
+
+        cluster = ReadFat(last);
+    }
+
+    if written < size { FILE_IO_ERROR } else { FILE_OK }
+}
+
+fn SetParentEntry(folder: *FileInfo, parent_cluster: u32) -> u32 {
+    operations->set_parent(folder, parent_cluster)
+}

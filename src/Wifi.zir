@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Console.zir", "src/Strings.zir", "src/Process.zir", "src/Esp.zir" : *]
+#[include "src/Console.zir", "src/Strings.zir", "src/Process.zir", "src/ESP.zir" : *]
 
 const WIFI_FIELD_SIZE: usize = 64;
 
@@ -184,8 +184,8 @@ fn JoinFailure(code: i32) -> *i8 {
     }
 }
 
-fn EspReady() -> bool {
-    if EspStart() {
+fn ESPReady() -> bool {
+    if ESPStart() {
         return true;
     }
 
@@ -193,15 +193,15 @@ fn EspReady() -> bool {
     false
 }
 
-fn ReportResult(result: EspResult) {
+fn ReportResult(result: ESPResult) {
     Write("ESP-01: ");
-    WriteLine(EspResultName(result));
+    WriteLine(ESPResultName(result));
 }
 
 fn StationMode() -> bool {
-    let result = EspCommand("AT+CWMODE=1", 2000);
+    let result = ESPCommand("AT+CWMODE=1", 2000);
 
-    if result != EspResult::Ok {
+    if result != ESPResult::Ok {
         ReportResult(result);
         return false;
     }
@@ -209,15 +209,15 @@ fn StationMode() -> bool {
     true
 }
 
-fn WifiScan() {
-    if !EspReady() || !StationMode() {
+fn WiFiScan() {
+    if !ESPReady() || !StationMode() {
         return;
     }
 
     WriteLine("scanning...");
-    let result = EspCommand("AT+CWLAP", 15000);
+    let result = ESPCommand("AT+CWLAP", 15000);
 
-    if result != EspResult::Ok {
+    if result != ESPResult::Ok {
         ReportResult(result);
         return;
     }
@@ -226,7 +226,7 @@ fn WifiScan() {
     let mut count: u32 = 0;
 
     loop {
-        let line = EspNextLine(&mut offset);
+        let line = ESPNextLine(&mut offset);
         if line == null { break; }
 
         let (mut security, mut rssi, mut channel) = (0, 0, 0);
@@ -262,15 +262,15 @@ fn WifiScan() {
     }
 }
 
-fn WifiAddress() {
-    if EspCommand("AT+CIFSR", 2000) != EspResult::Ok {
+fn WiFiAddress() {
+    if ESPCommand("AT+CIFSR", 2000) != ESPResult::Ok {
         return;
     }
 
     let mut offset: usize = 0;
 
     loop {
-        let line = EspNextLine(&mut offset);
+        let line = ESPNextLine(&mut offset);
         if line == null { break; }
 
         if ParseQuotedField(TextStartsWith(line, "+CIFSR:STAIP,"), &mut wifi_bssid[0], WIFI_FIELD_SIZE) != null {
@@ -283,7 +283,7 @@ fn WifiAddress() {
     }
 }
 
-fn WifiConnect(arguments: *i8) {
+fn WiFiConnect(arguments: *i8) {
     let rest = ParseArgument(arguments, &mut wifi_name[0], WIFI_FIELD_SIZE);
     wifi_password[0] = '\0';
 
@@ -292,14 +292,14 @@ fn WifiConnect(arguments: *i8) {
         return;
     }
 
-    if !EspReady() || !StationMode() {
+    if !ESPReady() || !StationMode() {
         return;
     }
 
-    EspBeginCommand("AT+CWJAP=");
-    EspAppendQuoted(&wifi_name[0]);
-    EspAppendCharacter(',');
-    EspAppendQuoted(&wifi_password[0]);
+    ESPBeginCommand("AT+CWJAP=");
+    ESPAppendQuoted(&wifi_name[0]);
+    ESPAppendCharacter(',');
+    ESPAppendQuoted(&wifi_password[0]);
 
     if esp_command_overflow {
         WriteLine("the name or the password is too long");
@@ -308,20 +308,20 @@ fn WifiConnect(arguments: *i8) {
 
     Write("connecting to ");
     WriteLine(&wifi_name[0]);
-    let result = EspCommand(&esp_command[0], 20000);
+    let result = ESPCommand(&esp_command[0], 20000);
 
-    if result == EspResult::Ok {
+    if result == ESPResult::Ok {
         WriteLine("connected");
-        WifiAddress();
+        WiFiAddress();
         return;
     }
 
-    if result == EspResult::Fail {
+    if result == ESPResult::Fail {
         let mut offset: usize = 0;
         let mut code = 4;
 
         loop {
-            let line = EspNextLine(&mut offset);
+            let line = ESPNextLine(&mut offset);
             if line == null { break; }
             ParseSignedField(TextStartsWith(line, "+CWJAP:"), &mut code);
         }
@@ -333,14 +333,14 @@ fn WifiConnect(arguments: *i8) {
     ReportResult(result);
 }
 
-fn WifiStatus() {
-    if !EspReady() {
+fn WiFiStatus() {
+    if !ESPReady() {
         return;
     }
 
-    let result = EspCommand("AT+CWJAP?", 2000);
+    let result = ESPCommand("AT+CWJAP?", 2000);
 
-    if result != EspResult::Ok {
+    if result != ESPResult::Ok {
         ReportResult(result);
         return;
     }
@@ -348,7 +348,7 @@ fn WifiStatus() {
     let mut offset: usize = 0;
 
     loop {
-        let line = EspNextLine(&mut offset);
+        let line = ESPNextLine(&mut offset);
         if line == null { break; }
 
         let (mut channel, mut rssi) = (0, 0);
@@ -365,7 +365,7 @@ fn WifiStatus() {
             Write(" dBm, channel ");
             WriteSigned(channel);
             WriteCharacter('\n');
-            WifiAddress();
+            WiFiAddress();
             return;
         }
     }
@@ -373,31 +373,31 @@ fn WifiStatus() {
     WriteLine("not connected");
 }
 
-fn WifiDisconnect() {
-    if !EspReady() {
+fn WiFiDisconnect() {
+    if !ESPReady() {
         return;
     }
 
-    let result = EspCommand("AT+CWQAP", 2000);
+    let result = ESPCommand("AT+CWQAP", 2000);
 
-    if result == EspResult::Ok {
+    if result == ESPResult::Ok {
         WriteLine("disconnected");
     } else {
         ReportResult(result);
     }
 }
 
-fn CommandWifi(arguments: *i8) {
+fn CommandWiFi(arguments: *i8) {
     let mut rest = arguments;
 
     if ParseCommand(arguments, "scan", &mut rest) {
-        WifiScan();
+        WiFiScan();
     } else if ParseCommand(arguments, "connect", &mut rest) {
-        WifiConnect(rest);
+        WiFiConnect(rest);
     } else if ParseCommand(arguments, "status", &mut rest) {
-        WifiStatus();
+        WiFiStatus();
     } else if ParseCommand(arguments, "disconnect", &mut rest) {
-        WifiDisconnect();
+        WiFiDisconnect();
     } else {
         WriteLine("usage: wifi scan | connect <name> [password] | status | disconnect");
     }
@@ -407,7 +407,7 @@ fn PingTime() -> u32 {
     let mut offset: usize = 0;
 
     loop {
-        let line = EspNextLine(&mut offset);
+        let line = ESPNextLine(&mut offset);
         if line == null { break; }
 
         let mut time = 0;
@@ -434,12 +434,12 @@ fn CommandPing(arguments: *i8) {
         return;
     }
 
-    if !EspReady() {
+    if !ESPReady() {
         return;
     }
 
-    EspBeginCommand("AT+PING=");
-    EspAppendQuoted(&wifi_name[0]);
+    ESPBeginCommand("AT+PING=");
+    ESPAppendQuoted(&wifi_name[0]);
 
     if esp_command_overflow {
         WriteLine("the host name is too long");
@@ -455,10 +455,10 @@ fn CommandPing(arguments: *i8) {
         }
 
         let started = GetTime();
-        let result = EspCommand(&esp_command[0], 6000);
+        let result = ESPCommand(&esp_command[0], 6000);
         let time = PingTime();
 
-        if result == EspResult::Ok && time != 0xFFFFFFFF {
+        if result == ESPResult::Ok && time != 0xFFFFFFFF {
             Write("reply from ");
             Write(&wifi_name[0]);
             Write(": ");
@@ -470,7 +470,7 @@ fn CommandPing(arguments: *i8) {
             if time > slowest { slowest = time; }
         } else {
             WriteLine("no reply");
-            rejected |= result == EspResult::Error && esp_response_length == 0 && GetTime() - started < 100;
+            rejected |= result == ESPResult::Error && esp_response_length == 0 && GetTime() - started < 100;
         }
     }
 
@@ -496,30 +496,30 @@ fn CommandPing(arguments: *i8) {
     }
 }
 
-fn CommandEsp(arguments: *i8) {
+fn CommandESP(arguments: *i8) {
     let mut rest = arguments;
 
     if AtEnd(arguments) {
         WriteLine("usage: esp on | off | reset | <AT command>");
     } else if ParseCommand(arguments, "on", &mut rest) {
-        if EspReady() { WriteLine("ESP-01 is ready"); }
+        if ESPReady() { WriteLine("ESP-01 is ready"); }
     } else if ParseCommand(arguments, "off", &mut rest) {
-        EspStop();
+        ESPStop();
         WriteLine("ESP-01 is off");
     } else if ParseCommand(arguments, "reset", &mut rest) {
-        EspStop();
+        ESPStop();
         Sleep(50);
-        if EspReady() { WriteLine("ESP-01 is ready"); }
-    } else if EspReady() {
-        let result = EspCommand(arguments, 10000);
+        if ESPReady() { WriteLine("ESP-01 is ready"); }
+    } else if ESPReady() {
+        let result = ESPCommand(arguments, 10000);
         let mut offset: usize = 0;
 
         loop {
-            let line = EspNextLine(&mut offset);
+            let line = ESPNextLine(&mut offset);
             if line == null { break; }
             WriteLine(line);
         }
 
-        WriteLine(EspResultName(result));
+        WriteLine(ESPResultName(result));
     }
 }

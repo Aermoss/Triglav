@@ -1,0 +1,709 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Volume.zir" : *]
+
+const MIN_CLUSTERS: u32 = 65525;
+const LONG_NAME_CHARACTERS: u32 = 13;
+const MAX_LONG_ENTRIES: u32 = 20;
+const LOWER_BASE: u32 = 0x08;
+const LOWER_EXTENSION: u32 = 0x10;
+const END_OF_CHAIN: u32 = 0x0FFFFFFF;
+
+static mut information_sector: u32 = 0;
+static mut information_dirty: bool = false;
+static long_name_offsets: [u32; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+
+fn FlushInformation() -> bool {
+    if !information_dirty || information_sector == 0 {
+        information_dirty = false;
+        return true;
+    }
+
+    let sector = LoadSector(information_sector);
+
+    if sector == null {
+        return false;
+    }
+
+    PutWord(sector + 488, free_clusters);
+    PutWord(sector + 492, next_free);
+    (sector_dirty, information_dirty) = (true, false);
+    true
+}
+
+fn IsBootSector(sector: *u8) -> bool {
+    (sector[0] == 0xEB || sector[0] == 0xE9) && GetHalf(sector + 11) == SECTOR_SIZE && sector[13] != 0 && sector[510] == 0x55 && sector[511] == 0xAA
+}
+
+fn FAT32Mount(start: u32, boot: *u8) -> bool {
+    let reserved = GetHalf(boot + 14);
+    let copies = boot[16] as u32;
+    let small_total = GetHalf(boot + 19);
+    let total = if small_total != 0 { small_total } else { GetWord(boot + 32) };
+    let size = GetWord(boot + 36);
+    let spc = boot[13] as u32;
+
+    if GetHalf(boot + 17) != 0 || GetHalf(boot + 22) != 0 || copies == 0 || copies > 2 || size == 0 || reserved == 0 || (spc & (spc - 1)) != 0 {
+        return false;
+    }
+
+    (volume_start, fat_start, fat_sectors, fat_copies) = (start, start + reserved, size, copies);
+    (cluster_sectors, cluster_bytes) = (spc, spc * SECTOR_SIZE);
+    data_start = fat_start + copies * size;
+
+    if total <= data_start - start {
+        return false;
+    }
+
+    cluster_count = (total - (data_start - start)) / spc;
+
+    if cluster_count < MIN_CLUSTERS {
+        return false;
+    }
+
+    if cluster_count + 2 > size * FAT_ENTRIES_PER_SECTOR {
+        cluster_count = size * FAT_ENTRIES_PER_SECTOR - 2;
+    }
+
+    root_cluster = GetWord(boot + 44);
+    let information = GetHalf(boot + 48);
+
+    if !IsValidCluster(root_cluster) {
+        return false;
+    }
+
+    information_sector = if information != 0 && information != 0xFFFF { start + information } else { 0 };
+    (free_clusters, next_free, information_dirty) = (UNKNOWN_COUNT, 2, false);
+
+    if information_sector != 0 {
+        let info = LoadSector(information_sector);
+
+        if info == null {
+            return false;
+        }
+
+        if GetWord(info as *u8) == 0x41615252 && GetWord(info as *u8 + 484) == 0x61417272 {
+            let (free, next) = (GetWord(info as *u8 + 488), GetWord(info as *u8 + 492));
+
+            if free <= cluster_count {
+                free_clusters = free;
+            }
+
+            if IsValidCluster(next) {
+                next_free = next;
+            }
+        } else {
+            information_sector = 0;
+        }
+    }
+
+    (chain_end, fat_mask, upcase_loaded) = (END_OF_CHAIN, 0x0FFFFFFF, false);
+    InitializeFAT32Operations();
+    operations = &fat32_operations;
+    true
+}
+
+fn ShortChecksum(entry: *u8) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i: usize = 0;
+
+    while i < 11 {
+        sum = ((((sum & 1) << 7) + (sum >> 1)) + entry[i] as u32) & 0xFF;
+        i += 1;
+    }
+
+    sum
+}
+
+fn ShortName(entry: *u8, name: *mut i8) {
+    let flags = entry[12] as u32;
+    let mut length: usize = 0;
+    let mut end: usize = 8;
+
+    while end > 0 && entry[end - 1] == (' ' as u8) {
+        end -= 1;
+    }
+
+    let mut i: usize = 0;
+
+    while i < end {
+        let mut value = entry[i];
+
+        if i == 0 && value == 0x05 {
+            value = 0xE5;
+        }
+
+        name[length] = if value >= 0x80 { '_' } else if (flags & LOWER_BASE) != 0 { LowerCharacter(value as i8) } else { value as i8 };
+        length += 1;
+        i += 1;
+    }
+
+    end = 11;
+
+    while end > 8 && entry[end - 1] == (' ' as u8) {
+        end -= 1;
+    }
+
+    if end > 8 {
+        name[length] = '.';
+        length += 1;
+        i = 8;
+
+        while i < end {
+            let value = entry[i];
+            name[length] = if value >= 0x80 { '_' } else if (flags & LOWER_EXTENSION) != 0 { LowerCharacter(value as i8) } else { value as i8 };
+            length += 1;
+            i += 1;
+        }
+    }
+
+    name[length] = '\0';
+}
+
+fn IsDotEntry(entry: *u8) -> bool {
+    entry[0] == ('.' as u8) && (entry[1] == (' ' as u8) || (entry[1] == ('.' as u8) && entry[2] == (' ' as u8)))
+}
+
+fn FAT32NextFile(cursor: *mut Cursor, info: *mut FileInfo) -> u32 {
+    let (mut long_count, mut long_checksum, mut long_next) = (0u32, 0u32, 0u32);
+    let (mut start_cluster, mut start_index) = (0u32, 0u32);
+
+    loop {
+        if cursor->cluster == 0 {
+            return if io_failed { FILE_IO_ERROR } else { FILE_NOT_FOUND };
+        }
+
+        let entry = EntryPointer(cursor as *Cursor);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        let first = entry[0] as u32;
+
+        if first == 0 {
+            return FILE_NOT_FOUND;
+        }
+
+        let attributes = entry[11] as u32;
+        let (here_cluster, here_index) = (cursor->cluster, cursor->index);
+
+        if first == 0xE5 {
+            long_count = 0;
+        } else if (attributes & 0x3F) == ATTRIBUTE_LONG_NAME {
+            let sequence = first & 0x1F;
+
+            if (first & 0x40) != 0 && sequence >= 1 && sequence <= MAX_LONG_ENTRIES {
+                (long_count, long_checksum, long_next) = (sequence, entry[13] as u32, sequence);
+                (start_cluster, start_index) = (here_cluster, here_index);
+            }
+
+            if long_count != 0 && sequence == long_next && entry[13] as u32 == long_checksum {
+                let mut j: u32 = 0;
+
+                while j < LONG_NAME_CHARACTERS {
+                    long_units[((sequence - 1) * LONG_NAME_CHARACTERS + j) as usize] = GetHalf(entry as *u8 + long_name_offsets[j as usize] as usize) as u16;
+                    j += 1;
+                }
+
+                long_next -= 1;
+            } else {
+                long_count = 0;
+            }
+        } else if (attributes & ATTRIBUTE_VOLUME) == 0 && !IsDotEntry(entry as *u8) {
+            ShortName(entry as *u8, &mut short_display[0]);
+            let has_long = long_count != 0 && long_next == 0 && ShortChecksum(entry as *u8) == long_checksum;
+
+            if !has_long || !LongNameToText(long_count * LONG_NAME_CHARACTERS, &mut info->name[0]) {
+                CopyText(&mut info->name[0], &short_display[0] as *i8, FILE_NAME_LENGTH);
+                (start_cluster, start_index) = (here_cluster, here_index);
+            }
+
+            info->size = GetWord(entry as *u8 + 28);
+            info->first_cluster = (GetHalf(entry as *u8 + 20) << 16) | GetHalf(entry as *u8 + 26);
+            info->attributes = attributes;
+            (info->entry_cluster, info->entry_index) = (here_cluster, here_index);
+            (info->start_cluster, info->start_index) = (start_cluster, start_index);
+            (info->cursor_index, info->cursor_cluster) = (0, info->first_cluster);
+            (info->flags, info->data_length, info->entry_count, info->parent_contiguous) = (0, info->size, 0, 0);
+
+            if IsFolder(info as *FileInfo) {
+                info->size = 0;
+            }
+
+            Advance(cursor);
+            return FILE_OK;
+        } else {
+            long_count = 0;
+        }
+
+        Advance(cursor);
+    }
+
+    FILE_NOT_FOUND
+}
+
+fn IsShortCharacter(value: u8) -> bool {
+    (value >= ('A' as u8) && value <= ('Z' as u8)) || (value >= ('0' as u8) && value <= ('9' as u8)) || value == ('!' as u8) || value == ('#' as u8) ||
+        value == ('$' as u8) || value == ('%' as u8) || value == ('&' as u8) || value == ('\'' as u8) || value == ('(' as u8) || value == (')' as u8) ||
+        value == ('-' as u8) || value == ('@' as u8) || value == ('^' as u8) || value == ('_' as u8) || value == ('`' as u8) || value == ('{' as u8) ||
+        value == ('}' as u8) || value == ('~' as u8)
+}
+
+fn UpperByte(value: u8) -> u8 {
+    if value >= ('a' as u8) && value <= ('z' as u8) { value - 32 } else { value }
+}
+
+fn ShortPart(bytes: *u8, start: u32, end: u32, limit: u32, short: *mut u8, case_flag: u32, flags: *mut u32) -> bool {
+    if end - start > limit {
+        return false;
+    }
+
+    let (mut lower, mut upper) = (false, false);
+    let mut i: u32 = 0;
+
+    while i < limit {
+        if start + i < end {
+            let value = bytes[(start + i) as usize];
+            lower = lower || (value >= ('a' as u8) && value <= ('z' as u8));
+            upper = upper || (value >= ('A' as u8) && value <= ('Z' as u8));
+
+            if !IsShortCharacter(UpperByte(value)) {
+                return false;
+            }
+
+            short[i as usize] = UpperByte(value);
+        } else {
+            short[i as usize] = ' ' as u8;
+        }
+
+        i += 1;
+    }
+
+    if lower && upper {
+        return false;
+    }
+
+    if lower {
+        *flags |= case_flag;
+    }
+
+    true
+}
+
+fn DirectShortName(name: *i8, short: *mut u8, flags: *mut u32) -> bool {
+    let bytes = name as *u8;
+    let length = StringLength(name);
+    let mut dot = length;
+    let mut i: u32 = 0;
+
+    while i < length {
+        if bytes[i as usize] == ('.' as u8) {
+            if dot != length {
+                return false;
+            }
+
+            dot = i;
+        }
+
+        i += 1;
+    }
+
+    *flags = 0;
+
+    if dot == 0 || (dot != length && dot == length - 1) {
+        return false;
+    }
+
+    ShortPart(bytes, 0, dot, 8, short, LOWER_BASE, flags) && ShortPart(bytes, if dot < length { dot + 1 } else { length }, length, 3, short + 8, LOWER_EXTENSION, flags)
+}
+
+fn ShortNameExists(folder: *FileInfo, short: *u8) -> bool {
+    let mut cursor = FolderCursor(folder);
+
+    while cursor.cluster != 0 {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null || entry[0] == 0 {
+            return false;
+        }
+
+        if entry[0] != 0xE5 && (entry[11] as u32 & 0x3F) != ATTRIBUTE_LONG_NAME {
+            let mut same = true;
+            let mut i: usize = 0;
+
+            while i < 11 && same {
+                same = entry[i] == short[i];
+                i += 1;
+            }
+
+            if same {
+                return true;
+            }
+        }
+
+        Advance(&mut cursor);
+    }
+
+    false
+}
+
+fn AliasPart(bytes: *u8, start: u32, end: u32, limit: u32, output: *mut u8) -> u32 {
+    let mut count: u32 = 0;
+    let mut i = start;
+
+    while i < end && count < limit {
+        let value = bytes[i as usize];
+
+        if value >= 0x80 {
+            if (value & 0xC0) != 0x80 {
+                output[count as usize] = '_' as u8;
+                count += 1;
+            }
+        } else if value != (' ' as u8) && value != ('.' as u8) {
+            output[count as usize] = if IsShortCharacter(UpperByte(value)) { UpperByte(value) } else { '_' as u8 };
+            count += 1;
+        }
+
+        i += 1;
+    }
+
+    count
+}
+
+fn MakeAlias(folder: *FileInfo, name: *i8, short: *mut u8) -> bool {
+    let bytes = name as *u8;
+    let length = StringLength(name);
+    let mut start: u32 = 0;
+
+    while start < length && (bytes[start as usize] == ('.' as u8) || bytes[start as usize] == (' ' as u8)) {
+        start += 1;
+    }
+
+    let mut dot = length;
+    let mut i = start;
+
+    while i < length {
+        if bytes[i as usize] == ('.' as u8) {
+            dot = i;
+        }
+
+        i += 1;
+    }
+
+    let mut base: [u8; 8];
+    let mut extension: [u8; 3];
+    let mut base_length = AliasPart(bytes, start, dot, 8, &mut base[0]);
+    let extension_length = if dot < length { AliasPart(bytes, dot + 1, length, 3, &mut extension[0]) } else { 0 };
+
+    if base_length == 0 {
+        base[0] = '_' as u8;
+        base_length = 1;
+    }
+
+    let mut number: u32 = 1;
+
+    while number < 1000000 {
+        let mut digits: [u8; 8];
+        let mut digit_count: u32 = 0;
+        let mut value = number;
+
+        while value > 0 {
+            digits[digit_count as usize] = ('0' as u8) + (value % 10) as u8;
+            digit_count += 1;
+            value /= 10;
+        }
+
+        let keep = if base_length + digit_count + 1 > 8 { 8 - digit_count - 1 } else { base_length };
+        let mut k: u32 = 0;
+
+        while k < 11 {
+            short[k as usize] = ' ' as u8;
+            k += 1;
+        }
+
+        k = 0;
+
+        while k < keep {
+            short[k as usize] = base[k as usize];
+            k += 1;
+        }
+
+        short[keep as usize] = '~' as u8;
+        k = 0;
+
+        while k < digit_count {
+            short[(keep + 1 + k) as usize] = digits[(digit_count - 1 - k) as usize];
+            k += 1;
+        }
+
+        k = 0;
+
+        while k < extension_length {
+            short[(8 + k) as usize] = extension[k as usize];
+            k += 1;
+        }
+
+        if !ShortNameExists(folder, short as *u8) {
+            return !io_failed;
+        }
+
+        number += 1;
+    }
+
+    false
+}
+
+fn FillShortEntry(entry: *mut u8, short: *u8, attributes: u32, flags: u32, cluster: u32, size: u32) {
+    let mut i: usize = 0;
+
+    while i < 32 {
+        entry[i] = 0;
+        i += 1;
+    }
+
+    i = 0;
+
+    while i < 11 {
+        entry[i] = short[i];
+        i += 1;
+    }
+
+    let stamp = FatTimestamp();
+    entry[11] = attributes as u8;
+    entry[12] = flags as u8;
+    PutHalf(entry + 14, stamp & 0xFFFF);
+    PutHalf(entry + 16, stamp >> 16);
+    PutHalf(entry + 18, stamp >> 16);
+    PutHalf(entry + 20, cluster >> 16);
+    PutHalf(entry + 22, stamp & 0xFFFF);
+    PutHalf(entry + 24, stamp >> 16);
+    PutHalf(entry + 26, cluster & 0xFFFF);
+    PutWord(entry + 28, size);
+}
+
+fn FAT32CreateEntry(folder: *mut FileInfo, name: *i8, attributes: u32, cluster: u32, size: u32, _flags: u32, _length: u32, info: *mut FileInfo) -> u32 {
+    if !IsValidName(name) {
+        return FILE_BAD_NAME;
+    }
+
+    let mut short: [u8; 11];
+    let mut flags: u32 = 0;
+    let mut long_entries: u32 = 0;
+
+    if !DirectShortName(name, &mut short[0], &mut flags) || ShortNameExists(folder, &short[0] as *u8) {
+        if io_failed || !MakeAlias(folder, name, &mut short[0]) {
+            return if io_failed { FILE_IO_ERROR } else { FILE_NO_SHORT_NAME };
+        }
+
+        flags = 0;
+        long_entries = (TextToLongName(name) + LONG_NAME_CHARACTERS - 1) / LONG_NAME_CHARACTERS;
+    }
+
+    let mut cursor = MakeCursor(0, 0);
+
+    if !FindFreeEntries(folder, long_entries + 1, &mut cursor) {
+        return if io_failed { FILE_IO_ERROR } else { FILE_NO_SPACE };
+    }
+
+    let (start_cluster, start_index) = (cursor.cluster, cursor.index);
+    let checksum = ShortChecksum(&short[0] as *u8);
+    let units = TextToLongName(name);
+    let mut k: u32 = 0;
+
+    while k < long_entries {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        let sequence = long_entries - k;
+        let mut i: usize = 0;
+
+        while i < 32 {
+            entry[i] = 0;
+            i += 1;
+        }
+
+        entry[0] = (sequence | (if k == 0 { 0x40 } else { 0 })) as u8;
+        entry[11] = ATTRIBUTE_LONG_NAME as u8;
+        entry[13] = checksum as u8;
+        let mut j: u32 = 0;
+
+        while j < LONG_NAME_CHARACTERS {
+            let index = (sequence - 1) * LONG_NAME_CHARACTERS + j;
+            let value: u32 = if index < units { long_units[index as usize] as u32 } else if index == units { 0 } else { 0xFFFF };
+            PutHalf(entry + long_name_offsets[j as usize] as usize, value);
+            j += 1;
+        }
+
+        sector_dirty = true;
+        Advance(&mut cursor);
+        k += 1;
+    }
+
+    let entry = EntryPointer(&cursor);
+
+    if entry == null {
+        return FILE_IO_ERROR;
+    }
+
+    FillShortEntry(entry, &short[0] as *u8, attributes, flags, cluster, size);
+    sector_dirty = true;
+    CopyText(&mut info->name[0], name, FILE_NAME_LENGTH);
+    (info->size, info->first_cluster, info->attributes) = (size, cluster, attributes);
+    (info->entry_cluster, info->entry_index, info->start_cluster, info->start_index) = (cursor.cluster, cursor.index, start_cluster, start_index);
+    (info->flags, info->data_length, info->entry_count, info->parent_contiguous) = (0, size, 0, 0);
+    (info->cursor_index, info->cursor_cluster) = (0, cluster);
+    FILE_OK
+}
+
+fn FAT32DeleteEntry(info: *FileInfo) -> u32 {
+    let mut cursor = EntryCursor(info, info->start_cluster, info->start_index);
+    let mut guard: u32 = 0;
+
+    loop {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        entry[0] = 0xE5;
+        sector_dirty = true;
+
+        if (cursor.cluster == info->entry_cluster && cursor.index == info->entry_index) || guard > MAX_LONG_ENTRIES {
+            return FILE_OK;
+        }
+
+        if !Advance(&mut cursor) {
+            return FILE_IO_ERROR;
+        }
+
+        guard += 1;
+    }
+
+    FILE_OK
+}
+
+fn FAT32UpdateEntry(info: *FileInfo, cluster: u32, size: u32) -> u32 {
+    let cursor = EntryCursor(info, info->entry_cluster, info->entry_index);
+    let entry = EntryPointer(&cursor);
+
+    if entry == null {
+        return FILE_IO_ERROR;
+    }
+
+    let stamp = FatTimestamp();
+    PutHalf(entry + 20, cluster >> 16);
+    PutHalf(entry + 26, cluster & 0xFFFF);
+    PutWord(entry + 28, size);
+    PutHalf(entry + 18, stamp >> 16);
+    PutHalf(entry + 22, stamp & 0xFFFF);
+    PutHalf(entry + 24, stamp >> 16);
+    entry[11] = (entry[11] as u32 | ATTRIBUTE_ARCHIVE) as u8;
+    sector_dirty = true;
+    FILE_OK
+}
+
+fn FAT32SetParent(folder: *FileInfo, parent_cluster: u32) -> u32 {
+    let mut cursor = FolderCursor(folder);
+
+    while cursor.cluster != 0 && cursor.index < 2 {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        if entry[0] == ('.' as u8) && entry[1] == ('.' as u8) {
+            let value = if parent_cluster == root_cluster { 0 } else { parent_cluster };
+            PutHalf(entry + 20, value >> 16);
+            PutHalf(entry + 26, value & 0xFFFF);
+            sector_dirty = true;
+            return FILE_OK;
+        }
+
+        Advance(&mut cursor);
+    }
+
+    FILE_OK
+}
+
+fn FAT32PrepareFolder(cluster: u32, parent_folder: *FileInfo) -> bool {
+    let mut dots: [u8; 11];
+    let mut i: usize = 0;
+
+    while i < 11 {
+        dots[i] = ' ' as u8;
+        i += 1;
+    }
+
+    dots[0] = '.' as u8;
+    let mut cursor = MakeCursor(cluster, 0);
+    let entry = EntryPointer(&cursor);
+
+    if entry != null {
+        FillShortEntry(entry, &dots[0] as *u8, ATTRIBUTE_FOLDER, 0, cluster, 0);
+        Advance(&mut cursor);
+        let parent_entry = EntryPointer(&cursor);
+
+        if parent_entry != null {
+            dots[1] = '.' as u8;
+            let parent = FolderCluster(parent_folder);
+            FillShortEntry(parent_entry, &dots[0] as *u8, ATTRIBUTE_FOLDER, 0, if parent == root_cluster { 0 } else { parent }, 0);
+        }
+
+        sector_dirty = true;
+    }
+
+    entry != null && !io_failed
+}
+
+static mut fat32_operations: VolumeOperations;
+
+fn FAT32IsFreeEntry(entry: *u8) -> bool {
+    entry[0] == 0 || entry[0] == 0xE5
+}
+
+fn FAT32GrowFolder(folder: *mut FileInfo, last: u32) -> u32 {
+    AllocateCluster(last, true)
+}
+
+fn FAT32IsClusterFree(cluster: u32) -> bool {
+    ReadFat(cluster) == FREE_CLUSTER
+}
+
+fn FAT32SetClusterUsed(cluster: u32, used: bool) -> bool {
+    used || WriteFat(cluster, FREE_CLUSTER)
+}
+
+fn InitializeFAT32Operations() {
+    fat32_operations.name = "FAT32";
+    fat32_operations.next_file = FAT32NextFile;
+    fat32_operations.create_entry = FAT32CreateEntry;
+    fat32_operations.delete_entry = FAT32DeleteEntry;
+    fat32_operations.update_entry = FAT32UpdateEntry;
+    fat32_operations.is_free_entry = FAT32IsFreeEntry;
+    fat32_operations.grow_folder = FAT32GrowFolder;
+    fat32_operations.is_cluster_free = FAT32IsClusterFree;
+    fat32_operations.set_cluster_used = FAT32SetClusterUsed;
+    fat32_operations.prepare_folder = FAT32PrepareFolder;
+    fat32_operations.set_parent = FAT32SetParent;
+    fat32_operations.flush = FlushInformation;
+}

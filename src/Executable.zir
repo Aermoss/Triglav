@@ -30,7 +30,7 @@ struct ExecutableHeader {
     pub relocation_count: u32
 }
 
-fn SpawnExecutable(file: *FileEntry, arguments: *i8, process: *mut u32) -> ExecutableError {
+fn SpawnExecutable(file: *mut FileInfo, arguments: *i8, process: *mut u32) -> ExecutableError {
     let header_size = sizeof(ExecutableHeader) as u32;
 
     if file == null || file->size < header_size || (file->size & 3) != 0 {
@@ -39,7 +39,7 @@ fn SpawnExecutable(file: *FileEntry, arguments: *i8, process: *mut u32) -> Execu
 
     let mut header: ExecutableHeader;
 
-    if ReadFile(file, 0, &mut header as *mut u8, header_size) != header_size {
+    if ReadFileRange(file, 0, &mut header as *mut u8, header_size) != header_size {
         return ExecutableError::InvalidFormat;
     }
 
@@ -60,7 +60,7 @@ fn SpawnExecutable(file: *FileEntry, arguments: *i8, process: *mut u32) -> Execu
     }
 
     let interrupts = DisableInterrupts();
-    let id = SpawnUser(FileName(file), arguments, USER_IMAGE_START + header.entry);
+    let id = SpawnUser(FileName(file as *FileInfo), arguments, USER_IMAGE_START + header.entry);
 
     if id == NO_PROCESS {
         RestoreInterrupts(interrupts);
@@ -81,7 +81,7 @@ fn SpawnExecutable(file: *FileEntry, arguments: *i8, process: *mut u32) -> Execu
     ExecutableError::None
 }
 
-fn LoadImage(id: u32, file: *FileEntry, header: *ExecutableHeader) -> ExecutableError {
+fn LoadImage(id: u32, file: *mut FileInfo, header: *ExecutableHeader) -> ExecutableError {
     let header_size = sizeof(ExecutableHeader) as u32;
     let code_size = header->code_words * 4;
     let root = CreateAddressSpace(id);
@@ -102,7 +102,7 @@ fn LoadImage(id: u32, file: *FileEntry, header: *ExecutableHeader) -> Executable
         let count = if code_size - offset < PAGE_SIZE { code_size - offset } else { PAGE_SIZE };
         let page = Translate(root, USER_IMAGE_START + offset, true) as *mut u8;
 
-        if ReadFile(file, header_size + offset, page, count) != count {
+        if ReadFileRange(file, header_size + offset, page, count) != count {
             return ExecutableError::InvalidFormat;
         }
 
@@ -118,7 +118,7 @@ fn LoadImage(id: u32, file: *FileEntry, header: *ExecutableHeader) -> Executable
         let count = if remaining < 64 { remaining } else { 64 };
         let bytes = count * 4;
 
-        if ReadFile(file, relocation_start + i * 4, &mut batch[0] as *mut u8, bytes) != bytes {
+        if ReadFileRange(file, relocation_start + i * 4, &mut batch[0] as *mut u8, bytes) != bytes {
             return ExecutableError::InvalidFormat;
         }
 
@@ -143,10 +143,6 @@ fn LoadImage(id: u32, file: *FileEntry, header: *ExecutableHeader) -> Executable
 }
 
 fn ExecuteFile(path: *i8, command_line: *i8, process: *mut u32) -> u32 {
-    if !HasFileSystem() {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
     let arguments = if command_line != null { command_line } else { path };
     let mut length: usize = 0;
 
@@ -158,17 +154,18 @@ fn ExecuteFile(path: *i8, command_line: *i8, process: *mut u32) -> u32 {
         }
     }
 
-    let file = FindFile(path);
+    let mut file: FileInfo;
+    let code = FindFile(path, &mut file);
 
-    if file == null {
-        return FILE_NOT_FOUND;
+    if code != FILE_OK {
+        return code;
     }
 
-    if IsDirectory(file) {
-        return FILE_IS_DIRECTORY;
+    if IsFolder(&file) {
+        return FILE_IS_FOLDER;
     }
 
-    match SpawnExecutable(file, arguments, process) {
+    match SpawnExecutable(&mut file, arguments, process) {
         ExecutableError::None => FILE_OK,
         ExecutableError::InvalidFormat => FILE_NOT_EXECUTABLE,
         ExecutableError::OutOfMemory => FILE_NO_MEMORY,

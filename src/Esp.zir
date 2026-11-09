@@ -23,7 +23,7 @@ const ESP_RESPONSE_SIZE: usize = 2048;
 const ESP_COMMAND_SIZE: usize = 192;
 const ESP_CLOSED: u32 = 0xFFFFFFFF;
 
-enum EspResult: u32 {
+enum ESPResult: u32 {
     Ok, Error, Fail, Timeout
 }
 
@@ -35,30 +35,29 @@ static mut esp_command: [i8; 192];
 static mut esp_command_length: usize = 0;
 static mut esp_command_overflow: bool = false;
 
-fn EspHasByte() -> bool {
-    (*(ESP_STATUS as *u32) & 1) != 0
+fn ESPHasByte() -> bool {
+    UARTHasByte(&esp_uart)
 }
 
-fn EspReadByte() -> i8 {
-    *(ESP_DATA as *u32) as i8
+fn ESPReadByte() -> i8 {
+    UARTRead(&esp_uart) as i8
 }
 
-fn EspWriteByte(value: i8) {
-    while (*(ESP_STATUS as *u32) & 2) != 0 {}
-    *(ESP_DATA as *mut u32) = value as u8 as u32;
+fn ESPWriteByte(value: i8) {
+    UARTWrite(&esp_uart, value as u8);
 }
 
-fn EspFlush() {
-    while EspHasByte() {
-        EspReadByte();
+fn ESPFlush() {
+    while ESPHasByte() {
+        ESPReadByte();
     }
 }
 
-fn EspReadLine(start: u32, timeout: u32) -> bool {
+fn ESPReadLine(start: u32, timeout: u32) -> bool {
     let mut length: usize = 0;
 
     loop {
-        while !EspHasByte() {
+        while !ESPHasByte() {
             if GetTime() - start >= timeout {
                 esp_line[length] = '\0';
                 return false;
@@ -67,7 +66,7 @@ fn EspReadLine(start: u32, timeout: u32) -> bool {
             Sleep(MILLISECONDS_PER_TICK);
         }
 
-        let character = EspReadByte();
+        let character = ESPReadByte();
 
         if character == '\n' {
             esp_line[length] = '\0';
@@ -81,7 +80,7 @@ fn EspReadLine(start: u32, timeout: u32) -> bool {
     }
 }
 
-fn EspLineEndsWith(suffix: *i8) -> bool {
+fn ESPLineEndsWith(suffix: *i8) -> bool {
     let mut length: usize = 0;
     let mut suffix_length: usize = 0;
 
@@ -95,40 +94,40 @@ fn EspLineEndsWith(suffix: *i8) -> bool {
     Equals(&esp_line[length - suffix_length], suffix)
 }
 
-fn EspStop() {
+fn ESPStop() {
     *(ESP_CONTROL as *mut u32) = 0;
     esp_running = false;
 }
 
-fn EspStart() -> bool {
+fn ESPStart() -> bool {
     if esp_running {
         return true;
     }
 
-    *(ESP_DIVISOR as *mut u32) = CLK_FREQ / ESP_BAUD_RATE;
+    UARTSetBaudRate(&esp_uart, ESP_BAUD_RATE);
     *(ESP_CONTROL as *mut u32) = ESP_ENABLE;
     Sleep(20);
-    EspFlush();
+    ESPFlush();
     *(ESP_CONTROL as *mut u32) = ESP_ENABLE | ESP_RUN;
     let start = GetTime();
 
-    while EspReadLine(start, ESP_READY_TIMEOUT) {
-        if EspLineEndsWith("ready") {
+    while ESPReadLine(start, ESP_READY_TIMEOUT) {
+        if ESPLineEndsWith("ready") {
             esp_running = true;
             break;
         }
     }
 
     if !esp_running {
-        EspStop();
+        ESPStop();
         return false;
     }
 
-    EspCommand("ATE0", 1000);
+    ESPCommand("ATE0", 1000);
     true
 }
 
-fn EspStoreLine() {
+fn ESPStoreLine() {
     let mut i: usize = 0;
 
     while esp_line[i] != '\0' {
@@ -146,36 +145,36 @@ fn EspStoreLine() {
     esp_response_length += i + 1;
 }
 
-fn EspCommand(command: *i8, timeout: u32) -> EspResult {
-    EspFlush();
+fn ESPCommand(command: *i8, timeout: u32) -> ESPResult {
+    ESPFlush();
     let mut current = command;
 
     while *current != '\0' {
-        EspWriteByte(*current);
+        ESPWriteByte(*current);
         current += 1;
     }
 
-    EspWriteByte('\r');
-    EspWriteByte('\n');
+    ESPWriteByte('\r');
+    ESPWriteByte('\n');
     esp_response_length = 0;
     let start = GetTime();
 
-    while EspReadLine(start, timeout) {
+    while ESPReadLine(start, timeout) {
         if Equals(&esp_line[0], "OK") {
-            return EspResult::Ok;
+            return ESPResult::Ok;
         } else if Equals(&esp_line[0], "ERROR") {
-            return EspResult::Error;
+            return ESPResult::Error;
         } else if Equals(&esp_line[0], "FAIL") {
-            return EspResult::Fail;
+            return ESPResult::Fail;
         } else if esp_line[0] != '\0' {
-            EspStoreLine();
+            ESPStoreLine();
         }
     }
 
-    EspResult::Timeout
+    ESPResult::Timeout
 }
 
-fn EspNextLine(offset: *mut usize) -> *i8 {
+fn ESPNextLine(offset: *mut usize) -> *i8 {
     if *offset >= esp_response_length {
         return null;
     }
@@ -190,12 +189,12 @@ fn EspNextLine(offset: *mut usize) -> *i8 {
     line
 }
 
-fn EspBeginCommand(text: *i8) {
+fn ESPBeginCommand(text: *i8) {
     (esp_command_length, esp_command_overflow) = (0, false);
-    EspAppend(text);
+    ESPAppend(text);
 }
 
-fn EspAppendCharacter(character: i8) {
+fn ESPAppendCharacter(character: i8) {
     if esp_command_length + 1 >= ESP_COMMAND_SIZE {
         esp_command_overflow = true;
         return;
@@ -206,47 +205,47 @@ fn EspAppendCharacter(character: i8) {
     esp_command[esp_command_length] = '\0';
 }
 
-fn EspAppend(mut text: *i8) {
+fn ESPAppend(mut text: *i8) {
     while *text != '\0' {
-        EspAppendCharacter(*text);
+        ESPAppendCharacter(*text);
         text += 1;
     }
 }
 
-fn EspAppendQuoted(mut text: *i8) {
-    EspAppendCharacter('"');
+fn ESPAppendQuoted(mut text: *i8) {
+    ESPAppendCharacter('"');
 
     while *text != '\0' {
         if *text == '"' || *text == ',' || *text == '\\' {
-            EspAppendCharacter('\\');
+            ESPAppendCharacter('\\');
         }
 
-        EspAppendCharacter(*text);
+        ESPAppendCharacter(*text);
         text += 1;
     }
 
-    EspAppendCharacter('"');
+    ESPAppendCharacter('"');
 }
 
-fn EspResultName(result: EspResult) -> *i8 {
+fn ESPResultName(result: ESPResult) -> *i8 {
     match result {
-        EspResult::Ok => "OK",
-        EspResult::Error => "ERROR",
-        EspResult::Fail => "FAIL",
-        EspResult::Timeout => "no answer"
+        ESPResult::Ok => "OK",
+        ESPResult::Error => "ERROR",
+        ESPResult::Fail => "FAIL",
+        ESPResult::Timeout => "no answer"
     }
 }
 
-fn EspAppendNumber(value: u32) {
+fn ESPAppendNumber(value: u32) {
     if value >= 10 {
-        EspAppendNumber(value / 10);
+        ESPAppendNumber(value / 10);
     }
 
-    EspAppendCharacter('0' + (value % 10) as i8);
+    ESPAppendCharacter('0' + (value % 10) as i8);
 }
 
-fn EspWaitByte(start: u32, timeout: u32) -> bool {
-    while !EspHasByte() {
+fn ESPWaitByte(start: u32, timeout: u32) -> bool {
+    while !ESPHasByte() {
         if GetTime() - start >= timeout {
             return false;
         }
@@ -257,48 +256,48 @@ fn EspWaitByte(start: u32, timeout: u32) -> bool {
     true
 }
 
-fn EspOpen(kind: *i8, host: *i8, port: u32) -> EspResult {
-    EspBeginCommand("AT+CIPSTART=");
-    EspAppendQuoted(kind);
-    EspAppendCharacter(',');
-    EspAppendQuoted(host);
-    EspAppendCharacter(',');
-    EspAppendNumber(port);
-    EspCommand(&esp_command[0], 10000)
+fn ESPOpen(kind: *i8, host: *i8, port: u32) -> ESPResult {
+    ESPBeginCommand("AT+CIPSTART=");
+    ESPAppendQuoted(kind);
+    ESPAppendCharacter(',');
+    ESPAppendQuoted(host);
+    ESPAppendCharacter(',');
+    ESPAppendNumber(port);
+    ESPCommand(&esp_command[0], 10000)
 }
 
-fn EspClose() {
-    EspCommand("AT+CIPCLOSE", 2000);
+fn ESPClose() {
+    ESPCommand("AT+CIPCLOSE", 2000);
 }
 
-fn EspSend(data: *u8, length: u32) -> bool {
-    EspBeginCommand("AT+CIPSEND=");
-    EspAppendNumber(length);
+fn ESPSend(data: *u8, length: u32) -> bool {
+    ESPBeginCommand("AT+CIPSEND=");
+    ESPAppendNumber(length);
 
-    if EspCommand(&esp_command[0], 2000) != EspResult::Ok {
+    if ESPCommand(&esp_command[0], 2000) != ESPResult::Ok {
         return false;
     }
 
     let start = GetTime();
 
     loop {
-        if !EspWaitByte(start, 2000) {
+        if !ESPWaitByte(start, 2000) {
             return false;
         }
 
-        if EspReadByte() == '>' {
+        if ESPReadByte() == '>' {
             break;
         }
     }
 
     for i in 0..length {
-        EspWriteByte(data[i as usize] as i8);
+        ESPWriteByte(data[i as usize] as i8);
     }
 
     true
 }
 
-fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
+fn ESPReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     let start = GetTime();
     let header = "+IPD,";
     let closed = "CLOSED";
@@ -306,11 +305,11 @@ fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     let mut closing: usize = 0;
 
     while header[matched] != '\0' {
-        if !EspWaitByte(start, timeout) {
+        if !ESPWaitByte(start, timeout) {
             return 0;
         }
 
-        let character = EspReadByte();
+        let character = ESPReadByte();
 
         if character == header[matched] {
             matched += 1;
@@ -332,11 +331,11 @@ fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     let mut length: u32 = 0;
 
     loop {
-        if !EspWaitByte(start, timeout) {
+        if !ESPWaitByte(start, timeout) {
             return 0;
         }
 
-        let character = EspReadByte();
+        let character = ESPReadByte();
 
         if character == ':' {
             break;
@@ -352,11 +351,11 @@ fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     let mut received: u32 = 0;
 
     while received < length {
-        if !EspWaitByte(start, timeout) {
+        if !ESPWaitByte(start, timeout) {
             return 0;
         }
 
-        let character = EspReadByte();
+        let character = ESPReadByte();
 
         if received < capacity {
             buffer[received as usize] = character as u8;
@@ -368,7 +367,7 @@ fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     if length < capacity { length } else { capacity }
 }
 
-fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
-    let length = EspReceivePacket(buffer, capacity, timeout);
+fn ESPReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
+    let length = ESPReceivePacket(buffer, capacity, timeout);
     if length == ESP_CLOSED { 0 } else { length }
 }

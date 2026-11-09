@@ -50,13 +50,13 @@ toolchain: files/zirconc files/svarog-as files/svarog-ld files/svarog-ar files/s
 $(IMAGER): tools/Imager.zir
 	$(COMPILER) $< -o $@ -I$(ZIRCON_PATH)/include
 
-bin/Files.bin: $(IMAGER) $(wildcard files/* files/*/* files/*/*/* $(ZIRCON_PATH)/include/*/*.zir $(ZIRCON_PATH)/include/*/*/*.zir $(ZIRCON_PATH)/include/*/*/*/*.zir)
+bin/Card.img: $(IMAGER) $(wildcard files/* files/*/* files/*/*/* $(ZIRCON_PATH)/include/*/*.zir $(ZIRCON_PATH)/include/*/*/*.zir $(ZIRCON_PATH)/include/*/*/*/*.zir)
 	$< files include=$(ZIRCON_PATH)/include -o $@
 
-build: bin/Triglav.bin bin/Files.bin
+build: bin/Triglav.bin
 
-emulate: bin/Triglav.bin bin/Files.bin
-	$(EMULATOR) $(SVAROG_PATH)/boot.hex --flash=bin/Triglav.bin --flash=bin/Files.bin@0x200000 --quiet
+emulate: bin/Triglav.bin bin/Card.img
+	$(EMULATOR) $(SVAROG_PATH)/boot.hex --flash=bin/Triglav.bin --sd=bin/Card.img --quiet
 
 clean:
 	del /Q files\zirconc files\svarog-as files\svarog-ld files\svarog-ar files\svarog-objdump files\svarog-nm files\svarog-strings src\Kernel.s bin\*

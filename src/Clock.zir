@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Esp.zir", "src/Wifi.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/ESP.zir", "src/WiFi.zir" : *]
 
 const NTP_PORT: u32 = 123;
 const NTP_PACKET_SIZE: u32 = 48;
@@ -36,14 +36,14 @@ fn PacketWord(offset: usize) -> u32 {
 }
 
 fn ClockSync() -> bool {
-    if !EspReady() {
+    if !ESPReady() {
         return false;
     }
 
-    EspCommand("ATE0", 1000);
-    EspClose();
+    ESPCommand("ATE0", 1000);
+    ESPClose();
 
-    if EspOpen("UDP", "pool.ntp.org", NTP_PORT) != EspResult::Ok {
+    if ESPOpen("UDP", "pool.ntp.org", NTP_PORT) != ESPResult::Ok {
         WriteLine("the time server could not be reached, is WiFi connected?");
         return false;
     }
@@ -55,15 +55,15 @@ fn ClockSync() -> bool {
     ntp_packet[0] = 0x1B;
     let sent = GetTime();
 
-    if !EspSend(&ntp_packet[0], NTP_PACKET_SIZE) {
-        EspClose();
+    if !ESPSend(&ntp_packet[0], NTP_PACKET_SIZE) {
+        ESPClose();
         WriteLine("the time request could not be sent");
         return false;
     }
 
-    let length = EspReceive(&mut ntp_packet[0], NTP_PACKET_SIZE, 5000);
+    let length = ESPReceive(&mut ntp_packet[0], NTP_PACKET_SIZE, 5000);
     let received = GetTime();
-    EspClose();
+    ESPClose();
     let seconds = PacketWord(40);
 
     if length != NTP_PACKET_SIZE || seconds < NTP_UNIX_OFFSET {

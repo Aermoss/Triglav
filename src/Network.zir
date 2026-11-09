@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/FileSystem.zir", "src/Esp.zir", "src/Wifi.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/FileSystem.zir", "src/ESP.zir", "src/WiFi.zir" : *]
 
 const DNS_PORT: u32 = 53;
 const DNS_PACKET_SIZE: u32 = 512;
@@ -25,11 +25,11 @@ static mut dns_length: u32 = 0;
 static mut dns_name: [i8; 256];
 static mut dns_server: [i8; 64];
 
-fn DnsWord(offset: u32) -> u32 {
+fn DNSWord(offset: u32) -> u32 {
     (dns_packet[offset as usize] as u32 << 8) | dns_packet[(offset + 1) as usize] as u32
 }
 
-fn DnsBuildQuery(name: *i8, id: u32) -> u32 {
+fn DNSBuildQuery(name: *i8, id: u32) -> u32 {
     (dns_packet[0], dns_packet[1]) = ((id >> 8) as u8, id as u8);
     (dns_packet[2], dns_packet[3]) = (0x01, 0x00);
     (dns_packet[4], dns_packet[5]) = (0, 1);
@@ -76,7 +76,7 @@ fn DnsBuildQuery(name: *i8, id: u32) -> u32 {
     length + 5
 }
 
-fn DnsSkipName(mut offset: u32) -> u32 {
+fn DNSSkipName(mut offset: u32) -> u32 {
     while offset < dns_length {
         let size = dns_packet[offset as usize] as u32;
 
@@ -94,7 +94,7 @@ fn DnsSkipName(mut offset: u32) -> u32 {
     dns_length + 1
 }
 
-fn DnsReadName(mut offset: u32) -> bool {
+fn DNSReadName(mut offset: u32) -> bool {
     let mut length: usize = 0;
     let mut jumps: u32 = 0;
 
@@ -146,42 +146,42 @@ fn WriteAddress(offset: u32) {
     }
 }
 
-fn DnsResolve(name: *i8, server: *i8) {
+fn DNSResolve(name: *i8, server: *i8) {
     let id = GetTime() & 0xFFFF;
-    let query_length = DnsBuildQuery(name, id);
+    let query_length = DNSBuildQuery(name, id);
 
     if query_length == 0 {
         WriteLine("the name is not valid");
         return;
     }
 
-    if !EspReady() {
+    if !ESPReady() {
         return;
     }
 
-    EspCommand("ATE0", 1000);
-    EspClose();
+    ESPCommand("ATE0", 1000);
+    ESPClose();
 
-    if EspOpen("UDP", server, DNS_PORT) != EspResult::Ok {
+    if ESPOpen("UDP", server, DNS_PORT) != ESPResult::Ok {
         WriteLine("the DNS server could not be reached, is WiFi connected?");
         return;
     }
 
-    if !EspSend(&dns_packet[0], query_length) {
-        EspClose();
+    if !ESPSend(&dns_packet[0], query_length) {
+        ESPClose();
         WriteLine("the DNS query could not be sent");
         return;
     }
 
-    dns_length = EspReceive(&mut dns_packet[0], DNS_PACKET_SIZE, 5000);
-    EspClose();
+    dns_length = ESPReceive(&mut dns_packet[0], DNS_PACKET_SIZE, 5000);
+    ESPClose();
 
-    if dns_length < 12 || DnsWord(0) != id || (DnsWord(2) & 0x8000) == 0 {
+    if dns_length < 12 || DNSWord(0) != id || (DNSWord(2) & 0x8000) == 0 {
         WriteLine("the DNS server did not answer");
         return;
     }
 
-    let code = DnsWord(2) & 0xF;
+    let code = DNSWord(2) & 0xF;
 
     if code == 3 {
         Write(name);
@@ -198,21 +198,21 @@ fn DnsResolve(name: *i8, server: *i8) {
 
     let mut offset: u32 = 12;
 
-    for _ in 0..DnsWord(4) {
-        offset = DnsSkipName(offset) + 4;
+    for _ in 0..DNSWord(4) {
+        offset = DNSSkipName(offset) + 4;
     }
 
     let mut addresses: u32 = 0;
 
-    for _ in 0..DnsWord(6) {
-        offset = DnsSkipName(offset);
+    for _ in 0..DNSWord(6) {
+        offset = DNSSkipName(offset);
 
         if offset + 10 > dns_length {
             break;
         }
 
-        let kind = DnsWord(offset);
-        let size = DnsWord(offset + 8);
+        let kind = DNSWord(offset);
+        let size = DNSWord(offset + 8);
         offset += 10;
 
         if offset + size > dns_length {
@@ -225,7 +225,7 @@ fn DnsResolve(name: *i8, server: *i8) {
             WriteAddress(offset);
             WriteCharacter('\n');
             addresses += 1;
-        } else if kind == 5 && DnsReadName(offset) {
+        } else if kind == 5 && DNSReadName(offset) {
             Write(name);
             Write(" is an alias for ");
             WriteLine(&dns_name[0]);
@@ -259,7 +259,7 @@ fn CommandHost(arguments: *i8) {
         return;
     }
 
-    DnsResolve(&wifi_name[0], &dns_server[0]);
+    DNSResolve(&wifi_name[0], &dns_server[0]);
 }
 
 const GET_INITIAL_SIZE: u32 = 32768;
@@ -296,7 +296,7 @@ fn RequestAppendNumber(value: u32) -> bool {
     RequestAppend(&digit[0])
 }
 
-fn ParseUrl(url: *i8, port: *mut u32) -> *i8 {
+fn ParseURL(url: *i8, port: *mut u32) -> *i8 {
     let mut current = url;
     let plain = TextStartsWith(current, "http://");
 
@@ -435,14 +435,14 @@ fn WriteStatusLine(data: *u8, length: u32) {
 }
 
 fn Download(path: *i8, port: u32, file: *i8) {
-    if !EspReady() {
+    if !ESPReady() {
         return;
     }
 
-    EspCommand("ATE0", 1000);
-    EspClose();
+    ESPCommand("ATE0", 1000);
+    ESPClose();
 
-    if EspOpen("TCP", &get_host[0], port) != EspResult::Ok {
+    if ESPOpen("TCP", &get_host[0], port) != ESPResult::Ok {
         Write("could not connect to ");
         WriteLine(&get_host[0]);
         return;
@@ -458,7 +458,7 @@ fn Download(path: *i8, port: u32, file: *i8) {
     fits = fits && RequestAppend("\r\nUser-Agent: Triglav\r\nConnection: close\r\n\r\n");
 
     if !fits {
-        EspClose();
+        ESPClose();
         WriteLine("the address is too long");
         return;
     }
@@ -467,16 +467,16 @@ fn Download(path: *i8, port: u32, file: *i8) {
     let mut data = Allocate(capacity);
 
     if data == null {
-        EspClose();
+        ESPClose();
         WriteLine(FileErrorMessage(FILE_NO_MEMORY));
         return;
     }
 
     let started = GetTime();
 
-    if !EspSend(&get_request[0] as *u8, get_request_length) {
+    if !ESPSend(&get_request[0] as *u8, get_request_length) {
         Free(data);
-        EspClose();
+        ESPClose();
         WriteLine("the request could not be sent");
         return;
     }
@@ -505,7 +505,7 @@ fn Download(path: *i8, port: u32, file: *i8) {
             (data, capacity) = (larger, capacity * 2);
         }
 
-        let received = EspReceivePacket(data + length as usize, capacity - length, GET_TIMEOUT);
+        let received = ESPReceivePacket(data + length as usize, capacity - length, GET_TIMEOUT);
 
         if received == ESP_CLOSED {
             complete = true;
@@ -526,7 +526,7 @@ fn Download(path: *i8, port: u32, file: *i8) {
         }
     }
 
-    EspClose();
+    ESPClose();
 
     if reported != 0 {
         WriteCharacter('\n');
@@ -609,7 +609,7 @@ fn CommandGet(arguments: *i8) {
     }
 
     let mut port: u32 = 80;
-    let path = ParseUrl(&get_url[0], &mut port);
+    let path = ParseURL(&get_url[0], &mut port);
 
     if path == null {
         WriteLine("usage: get http://host[:port]/path <file>");

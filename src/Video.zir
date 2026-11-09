@@ -35,6 +35,14 @@ static mut screen_scroll: u32 = 0;
 static mut screen_attribute: u32 = DEFAULT_ATTRIBUTE;
 static mut escape_state: u32 = ESCAPE_NONE;
 static mut escape_parameter: u32 = 0;
+static mut utf8_code: u32 = 0;
+static mut utf8_remaining: u32 = 0;
+
+static cp437_upper: [u16; 48] = [
+    0xC7, 0xFC, 0xE9, 0xE2, 0xE4, 0xE0, 0xE5, 0xE7, 0xEA, 0xEB, 0xE8, 0xEF, 0xEE, 0xEC, 0xC4, 0xC5,
+    0xC9, 0xE6, 0xC6, 0xF4, 0xF6, 0xF2, 0xFB, 0xF9, 0xFF, 0xD6, 0xDC, 0xA2, 0xA3, 0xA5, 0x20A7, 0x192,
+    0xE1, 0xED, 0xF3, 0xFA, 0xF1, 0xD1, 0xAA, 0xBA, 0xBF, 0x2310, 0xAC, 0xBD, 0xBC, 0xA1, 0xAB, 0xBB
+];
 
 fn SetCell(row: u32, column: u32, character: u32) {
     let shown_row = (row + screen_scroll) % SCREEN_ROWS;
@@ -100,10 +108,65 @@ fn HandleEscape(character: i8) {
     }
 }
 
+fn Glyph(code: u32) -> u32 {
+    let mut i: u32 = 0;
+
+    while i < 48 {
+        if cp437_upper[i as usize] as u32 == code {
+            return 0x80 + i;
+        }
+
+        i += 1;
+    }
+
+    if code == 0xDF { 0xE1 } else if code == 0xB5 { 0xE6 } else if code == 0xB1 { 0xF1 } else if code == 0xF7 { 0xF6 } else if code == 0xB0 { 0xF8 }
+    else if code == 0xB7 { 0xFA } else if code == 0xB2 { 0xFD } else if code == 0xA0 { 0xFF } else if code == 0x11F { 'g' as u32 }
+    else if code == 0x11E { 'G' as u32 } else if code == 0x15F { 's' as u32 } else if code == 0x15E { 'S' as u32 } else if code == 0x131 { 'i' as u32 }
+    else if code == 0x130 { 'I' as u32 } else { '?' as u32 }
+}
+
+fn PutGlyph(glyph: u32) {
+    SetCell(screen_row, screen_column, glyph);
+    screen_column += 1;
+
+    if screen_column == SCREEN_COLUMNS {
+        NewLine();
+    }
+}
+
 fn ScreenCharacter(character: i8) {
     let interrupts = DisableInterrupts();
+    let value = character as u8 as u32;
 
-    if escape_state != ESCAPE_NONE {
+    if utf8_remaining > 0 {
+        if (value & 0xC0) == 0x80 {
+            utf8_code = (utf8_code << 6) | (value & 0x3F);
+            utf8_remaining -= 1;
+
+            if utf8_remaining == 0 {
+                PutGlyph(Glyph(utf8_code));
+            }
+
+            UpdateCursor();
+            RestoreInterrupts(interrupts);
+            return;
+        }
+
+        utf8_remaining = 0;
+        PutGlyph('?' as u32);
+    }
+
+    if value >= 0x80 {
+        if value >= 0xC0 && value < 0xF8 {
+            if value >= 0xF0 {
+                (utf8_code, utf8_remaining) = (value & 0x07, 3);
+            } else if value >= 0xE0 {
+                (utf8_code, utf8_remaining) = (value & 0x0F, 2);
+            } else {
+                (utf8_code, utf8_remaining) = (value & 0x1F, 1);
+            }
+        }
+    } else if escape_state != ESCAPE_NONE {
         HandleEscape(character);
     } else if character == '\x1B' {
         escape_state = ESCAPE_STARTED;
@@ -115,13 +178,8 @@ fn ScreenCharacter(character: i8) {
         if screen_column > 0 {
             screen_column -= 1;
         }
-    } else if character < '\0' || character >= ' ' {
-        SetCell(screen_row, screen_column, (character as u8) as u32);
-        screen_column += 1;
-
-        if screen_column == SCREEN_COLUMNS {
-            NewLine();
-        }
+    } else if character >= ' ' {
+        PutGlyph(value);
     }
 
     UpdateCursor();

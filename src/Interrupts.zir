@@ -28,7 +28,7 @@ enum TrapCause: u32 {
     StoreFault = 0x00000007,
     SystemCall = 0x00000008,
     Timer = 0x80000000,
-    Uart = 0x80000001,
+    UART = 0x80000001,
     Unknown = 0xFFFFFFFF
 }
 
@@ -153,7 +153,7 @@ fn ValidateCall(call: SystemCall, frame: *Frame) -> bool {
         SystemCall::Write => UserBuffer(a1, a2, false),
         SystemCall::Seek => UserWord(a3),
         SystemCall::Size => UserWord(a1),
-        SystemCall::ListFolder => UserString(a0) && UserBufferOrNull(a1, (if a2 < MAX_FILES { a2 } else { MAX_FILES }) * LIST_ENTRY_SIZE, true) && UserWord(a3),
+        SystemCall::ListFolder => UserString(a0) && a2 <= MAX_LIST_ENTRIES && UserBufferOrNull(a1, a2 * LIST_ENTRY_SIZE, true) && UserWord(a3),
         SystemCall::Rename => UserString(a0) && UserString(a1),
         SystemCall::Execute => UserString(a0) && UserStringOrNull(a1) && UserBufferOrNull(a2, 4, true),
         _ => true
@@ -171,7 +171,7 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
             WakeSleepingProcesses();
             return Schedule(frame);
         },
-        TrapCause::Uart => {
+        TrapCause::UART => {
             ReceiveCharacter();
             let woken = WakeWaitingProcesses();
 
@@ -269,13 +269,13 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                     frame->a0 = GetFileSize(frame->a0, frame->a1 as *mut u32);
                 },
                 SystemCall::ListFolder => {
-                    frame->a0 = ListDirectory(frame->a0 as *i8, frame->a1 as *mut u8, frame->a2, frame->a3 as *mut u32);
+                    frame->a0 = ListFolder(frame->a0 as *i8, frame->a1 as *mut u8, frame->a2, frame->a3 as *mut u32);
                 },
                 SystemCall::CreateFolder => {
-                    frame->a0 = MakeDirectory(frame->a0 as *i8);
+                    frame->a0 = CreateFolder(frame->a0 as *i8);
                 },
                 SystemCall::RemoveFolder => {
-                    frame->a0 = RemoveDirectory(frame->a0 as *i8);
+                    frame->a0 = RemoveFolder(frame->a0 as *i8);
                 },
                 SystemCall::Rename => {
                     frame->a0 = RenamePath(frame->a0 as *i8, frame->a1 as *i8);

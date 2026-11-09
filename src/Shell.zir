@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/Wifi.zir", "src/Clock.zir", "src/Network.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/WiFi.zir", "src/Clock.zir", "src/Network.zir" : *]
 
 const LINE_LENGTH: usize = 128;
 const DUMP_LENGTH: u32 = 64;
-const CAT_BUFFER_SIZE: usize = 64;
+const CAT_BUFFER_SIZE: usize = 512;
+const NAME_COLUMN: u32 = 32;
 
 fn CommandHelp() {
     WriteLine("help                     show the commands");
@@ -36,17 +37,16 @@ fn CommandHelp() {
     WriteLine("ps                       show the processes");
     WriteLine("run <program>            start anim, counter, spin or hello as a process");
     WriteLine("kill <pid>               stop a process");
-    WriteLine("ls [path]                show a directory");
+    WriteLine("ls [path]                show a folder, quote paths with spaces");
     WriteLine("cat <file>               print a file");
     WriteLine("write <file> <text>      write the text into a file");
-    WriteLine("mkdir <path>             make a directory");
-    WriteLine("cd [path]                go into a directory, or to the root");
-    WriteLine("pwd                      show the current directory");
+    WriteLine("mkdir <path>             make a folder");
+    WriteLine("cd [path]                go into a folder, or to the root");
+    WriteLine("pwd                      show the current folder");
     WriteLine("cp <source> <target>     copy a file");
-    WriteLine("mv <source> <target>     move or rename a file or a directory");
-    WriteLine("rm <path>                delete a file or an empty directory");
-    WriteLine("df                       show how much of the file system is used");
-    WriteLine("format                   make an empty file system, the files are lost");
+    WriteLine("mv <source> <target>     move or rename a file or a folder");
+    WriteLine("rm <path>                delete a file or an empty folder");
+    WriteLine("df                       show how much of the SD card is used");
     WriteLine("esp on | off | reset     power the ESP-01 on or off, or restart it");
     WriteLine("esp <AT command>         send an AT command to the ESP-01");
     WriteLine("wifi scan                show the WiFi networks nearby");
@@ -77,12 +77,18 @@ fn CommandInfo() {
     WriteRange("Kernel:   ", SDRAM_START, kernel_end);
     WriteRange("Heap:     ", heap_start, heap_end);
     WriteRange("Flash:    ", FLASH_START, FLASH_END);
-    Write("Flash ID: 0x");
-    WriteHexadecimalDigits(ReadFlashId(), 6);
-    WriteCharacter('\n');
 
     if HasFileSystem() {
-        WriteRange("Files:    ", FILE_SYSTEM_START, FILE_SYSTEM_START + FileSystemBlocks() * BLOCK_SIZE);
+        Write("SD card:  ");
+        WriteInteger(sd_sectors / 2048);
+        Write(" MB, ");
+        Write(FileSystemName());
+        Write(" with ");
+        WriteInteger(cluster_bytes);
+        Write(" byte clusters, ");
+        WriteLine(if sd_block_addressing { "SDHC" } else { "SDSC" });
+    } else {
+        WriteLine("SD card:  none");
     }
 }
 
@@ -330,7 +336,7 @@ fn CommandProcesses() {
     }
 }
 
-fn RunExecutable(file: *FileEntry, arguments: *i8) {
+fn RunExecutable(file: *mut FileInfo, arguments: *i8) {
     let mut process = NO_PROCESS;
 
     match SpawnExecutable(file, arguments, &mut process) {
@@ -360,19 +366,15 @@ fn RunExecutable(file: *FileEntry, arguments: *i8) {
 }
 
 fn RunFile(path: *i8, command_line: *i8) {
-    if !HasFileSystem() {
-        ReportFileError(FILE_NO_FILE_SYSTEM);
-        return;
-    }
+    let mut file: FileInfo;
+    let error = FindFile(path, &mut file);
 
-    let file = FindFile(path);
-
-    if file == null {
-        ReportFileError(FILE_NOT_FOUND);
-    } else if IsDirectory(file) {
-        ReportFileError(FILE_IS_DIRECTORY);
+    if error != FILE_OK {
+        ReportFileError(error);
+    } else if IsFolder(&file) {
+        ReportFileError(FILE_IS_FOLDER);
     } else {
-        RunExecutable(file, command_line);
+        RunExecutable(&mut file, command_line);
     }
 }
 
@@ -428,7 +430,7 @@ fn ReportFileError(error: u32) {
 }
 
 fn ParseOnePath(arguments: *i8, usage: *i8) -> bool {
-    let rest = ParseWord(arguments, &mut first_path[0], LINE_LENGTH as u32);
+    let rest = ParseArgument(arguments, &mut first_path[0], LINE_LENGTH);
 
     if rest == null || !AtEnd(rest) {
         WriteLine(usage);
@@ -439,10 +441,10 @@ fn ParseOnePath(arguments: *i8, usage: *i8) -> bool {
 }
 
 fn ParseTwoPaths(arguments: *i8, usage: *i8) -> bool {
-    let mut rest = ParseWord(arguments, &mut first_path[0], LINE_LENGTH as u32);
+    let mut rest = ParseArgument(arguments, &mut first_path[0], LINE_LENGTH);
 
     if rest != null {
-        rest = ParseWord(rest, &mut second_path[0], LINE_LENGTH as u32);
+        rest = ParseArgument(rest, &mut second_path[0], LINE_LENGTH);
     }
 
     if rest == null || !AtEnd(rest) {
@@ -453,56 +455,72 @@ fn ParseTwoPaths(arguments: *i8, usage: *i8) -> bool {
     true
 }
 
-fn WriteEntry(file: *FileEntry) {
-    if IsDirectory(file) {
-        Write(FileName(file));
-        WriteLine("/");
-    } else {
-        WriteColumn(FileName(file), FILE_NAME_LENGTH);
-        WriteInteger(file->size);
-        WriteLine(" bytes");
-    }
-}
+fn WriteEntry(name: *i8, folder: bool, size: u32) {
+    Write(name);
 
-fn CommandList(arguments: *i8) {
-    if !HasFileSystem() {
-        ReportFileError(FILE_NO_FILE_SYSTEM);
+    if folder {
+        WriteLine("/");
         return;
     }
 
-    let mut index = IndexOfId(current_directory);
+    let length = StringLength(name);
+    WriteSpaces(if length < NAME_COLUMN { NAME_COLUMN - length } else { 1 });
+    WriteInteger(size);
+    WriteLine(" bytes");
+}
+
+fn CommandList(arguments: *i8) {
+    let mut path = ".";
 
     if !AtEnd(arguments) {
         if !ParseOnePath(arguments, "Usage: ls [path]") {
             return;
         }
 
-        index = FindPath(&first_path[0] as *i8);
+        path = &first_path[0] as *i8;
     }
 
-    if index == NO_ENTRY {
-        ReportFileError(FILE_NOT_FOUND);
+    let mut file: FileInfo;
+    let mut error = FindFile(path, &mut file);
+
+    if error == FILE_OK && !IsFolder(&file) {
+        WriteEntry(FileName(&file), false, file.size);
         return;
     }
 
-    if !IsDirectoryIndex(index) {
-        WriteEntry(GetFile(index) as *FileEntry);
+    let mut count: u32 = 0;
+
+    if error == FILE_OK {
+        error = ListFolder(path, null, 0, &mut count);
+    }
+
+    if error != FILE_OK || count == 0 {
+        ReportFileError(error);
         return;
     }
 
-    let directory = IdOfIndex(index);
-    let count = FileCount();
-    let mut i: u32 = 0;
+    let buffer = Allocate(count * LIST_ENTRY_SIZE);
 
-    while i < count {
-        let file = GetFile(i) as *FileEntry;
+    if buffer == null {
+        ReportFileError(FILE_NO_MEMORY);
+        return;
+    }
 
-        if file->parent == directory {
-            WriteEntry(file);
+    error = ListFolder(path, buffer, count, &mut count);
+
+    if error == FILE_OK {
+        let mut i: u32 = 0;
+
+        while i < count {
+            let record = buffer + (i * LIST_ENTRY_SIZE) as usize;
+            let fields = (record + FILE_NAME_LENGTH as usize) as *u32;
+            WriteEntry(record as *i8, fields[0] == KIND_FOLDER, fields[1]);
+            i += 1;
         }
-
-        i += 1;
     }
+
+    Free(buffer);
+    ReportFileError(error);
 }
 
 fn CommandCat(arguments: *i8) {
@@ -510,20 +528,16 @@ fn CommandCat(arguments: *i8) {
         return;
     }
 
-    if !HasFileSystem() {
-        ReportFileError(FILE_NO_FILE_SYSTEM);
+    let mut file: FileInfo;
+    let error = FindFile(&first_path[0] as *i8, &mut file);
+
+    if error != FILE_OK {
+        ReportFileError(error);
         return;
     }
 
-    let file = FindFile(&first_path[0] as *i8);
-
-    if file == null {
-        ReportFileError(FILE_NOT_FOUND);
-        return;
-    }
-
-    if IsDirectory(file) {
-        ReportFileError(FILE_IS_DIRECTORY);
+    if IsFolder(&file) {
+        ReportFileError(FILE_IS_FOLDER);
         return;
     }
 
@@ -531,7 +545,7 @@ fn CommandCat(arguments: *i8) {
     let mut offset: u32 = 0;
 
     loop {
-        let count = ReadFile(file, offset, &mut buffer[0], CAT_BUFFER_SIZE as u32);
+        let count = ReadFileRange(&mut file, offset, &mut buffer[0], CAT_BUFFER_SIZE as u32);
 
         if count == 0 {
             break;
@@ -549,7 +563,7 @@ fn CommandCat(arguments: *i8) {
 }
 
 fn CommandWrite(arguments: *i8) {
-    let rest = ParseWord(arguments, &mut first_path[0], LINE_LENGTH as u32);
+    let rest = ParseArgument(arguments, &mut first_path[0], LINE_LENGTH);
 
     if rest == null {
         WriteLine("Usage: write <file> <text>");
@@ -578,9 +592,9 @@ fn CommandWrite(arguments: *i8) {
     ReportFileError(error);
 }
 
-fn CommandMakeDirectory(arguments: *i8) {
+fn CommandCreateFolder(arguments: *i8) {
     if ParseOnePath(arguments, "Usage: mkdir <path>") {
-        ReportFileError(MakeDirectory(&first_path[0] as *i8));
+        ReportFileError(CreateFolder(&first_path[0] as *i8));
     }
 }
 
@@ -590,35 +604,16 @@ fn CommandRemove(arguments: *i8) {
     }
 }
 
-fn CommandChangeDirectory(arguments: *i8) {
+fn CommandChangeFolder(arguments: *i8) {
     if AtEnd(arguments) {
-        ReportFileError(ChangeDirectory("/"));
+        ReportFileError(ChangeFolder("/"));
     } else if ParseOnePath(arguments, "Usage: cd [path]") {
-        ReportFileError(ChangeDirectory(&first_path[0] as *i8));
+        ReportFileError(ChangeFolder(&first_path[0] as *i8));
     }
 }
 
-fn WriteDirectoryPath(id: u32) {
-    let index = IndexOfId(id);
-
-    if id == ROOT_DIRECTORY || index == NO_ENTRY {
-        return;
-    }
-
-    let file = GetFile(index) as *FileEntry;
-    WriteDirectoryPath(file->parent);
-    WriteCharacter('/');
-    Write(FileName(file));
-}
-
-fn CommandPrintDirectory() {
-    if current_directory == ROOT_DIRECTORY {
-        WriteCharacter('/');
-    } else {
-        WriteDirectoryPath(current_directory);
-    }
-
-    WriteCharacter('\n');
+fn CommandPrintFolder() {
+    WriteLine(CurrentFolder());
 }
 
 fn CommandCopy(arguments: *i8) {
@@ -634,39 +629,28 @@ fn CommandMove(arguments: *i8) {
 }
 
 fn CommandDiskFree() {
-    if !HasFileSystem() {
-        ReportFileError(FILE_NO_FILE_SYSTEM);
+    let (mut total, mut free, mut bytes) = (0u32, 0u32, 0u32);
+    let error = FileSystemStatistics(&mut total, &mut free, &mut bytes);
+
+    if error != FILE_OK {
+        ReportFileError(error);
         return;
     }
 
-    let (total, used) = (FileSystemBlocks(), UsedBlockCount());
-    Write("Blocks:  ");
-    WriteInteger(used);
+    let sectors = bytes / 512;
+    Write("Clusters: ");
+    WriteInteger(total - free);
     Write(" of ");
     WriteInteger(total);
     Write(" used, ");
-    WriteInteger(BLOCK_SIZE);
+    WriteInteger(bytes);
     WriteLine(" bytes each");
-    Write("Free:    ");
-    WriteInteger((total - used) * BLOCK_SIZE);
-    WriteLine(" bytes");
-    Write("Entries: ");
-    WriteInteger(FileCount());
-    Write(" of ");
-    WriteInteger(MAX_FILES);
-    Write(", the table is in block ");
-    WriteInteger(current_table);
-    Write(" at ");
-    WriteInteger(current_offset);
-    WriteCharacter('\n');
-}
-
-fn CommandFormat() {
-    let error = FormatFileSystem(DEFAULT_BLOCKS);
-
-    if error != FILE_OK {
-        WriteLine(FileErrorMessage(error));
-    }
+    Write("Used:     ");
+    WriteInteger((total - free) * sectors / 2);
+    WriteLine(" KB");
+    Write("Free:     ");
+    WriteInteger(free * sectors / 2);
+    WriteLine(" KB");
 }
 
 fn RunCommand(line: *i8) {
@@ -715,23 +699,21 @@ fn RunCommand(line: *i8) {
     } else if ParseCommand(line, "rm", &mut arguments) {
         CommandRemove(arguments);
     } else if ParseCommand(line, "mkdir", &mut arguments) {
-        CommandMakeDirectory(arguments);
+        CommandCreateFolder(arguments);
     } else if ParseCommand(line, "cd", &mut arguments) {
-        CommandChangeDirectory(arguments);
+        CommandChangeFolder(arguments);
     } else if ParseCommand(line, "pwd", &mut arguments) {
-        CommandPrintDirectory();
+        CommandPrintFolder();
     } else if ParseCommand(line, "cp", &mut arguments) {
         CommandCopy(arguments);
     } else if ParseCommand(line, "mv", &mut arguments) {
         CommandMove(arguments);
     } else if ParseCommand(line, "df", &mut arguments) {
         CommandDiskFree();
-    } else if ParseCommand(line, "format", &mut arguments) {
-        CommandFormat();
     } else if ParseCommand(line, "esp", &mut arguments) {
-        CommandEsp(arguments);
+        CommandESP(arguments);
     } else if ParseCommand(line, "wifi", &mut arguments) {
-        CommandWifi(arguments);
+        CommandWiFi(arguments);
     } else if ParseCommand(line, "date", &mut arguments) {
         CommandDate(arguments);
     } else if ParseCommand(line, "ping", &mut arguments) {

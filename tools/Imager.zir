@@ -16,51 +16,51 @@
 
 #[include "std/io", "std/str", "std/vec", "std/file" : *]
 
-const IMAGE_MAGIC: u32 = 0x53464754;
-const IMAGE_VERSION: u32 = 4;
-const BLOCK_SIZE: u32 = 4096;
-const TABLE_BLOCKS: u32 = 8;
-const MAX_BLOCKS: u32 = 1536;
-const DEFAULT_BLOCKS: u32 = 512;
-const HEADER_SIZE: u32 = 32;
-const ENTRY_SIZE: u32 = 64;
-const NAME_LENGTH: u32 = 32;
-const MAX_ENTRIES: u32 = 63;
-const CHECKSUM_SEED: u32 = 0x5A5A5A5A;
-const DIRECTORY: u32 = 1;
+const SECTOR_SIZE: u32 = 512;
+const PARTITION_START: u32 = 2048;
+const RESERVED_SECTORS: u32 = 32;
+const FAT_COUNT: u32 = 2;
+const ROOT_CLUSTER: u32 = 2;
+const DEFAULT_MEGABYTES: u32 = 64;
+const MAX_MEGABYTES: u32 = 2048;
+const MIN_CLUSTERS: u32 = 65525;
+const ENTRY_SIZE: u32 = 32;
+const LONG_NAME_CHARACTERS: usize = 13;
+const MAX_NAME_UNITS: usize = 255;
+const ATTRIBUTE_FOLDER: u8 = 0x10;
+const ATTRIBUTE_ARCHIVE: u8 = 0x20;
+const ATTRIBUTE_LONG_NAME: u8 = 0x0F;
+const LOWER_BASE: u8 = 0x08;
+const LOWER_EXTENSION: u8 = 0x10;
+const END_OF_CHAIN: u32 = 0x0FFFFFFF;
+const FAT_DATE: u32 = ((2026 - 1980) << 9) | (1 << 5) | 1;
+const VOLUME_ID: u32 = 0x54524C56;
+const FOLDER: u32 = 1;
 
-fn PutWord(image: *mut u8, offset: u32, value: u32) {
-    image[offset as usize] = (value & 0xFF) as u8;
-    image[(offset + 1) as usize] = ((value >> 8) & 0xFF) as u8;
-    image[(offset + 2) as usize] = ((value >> 16) & 0xFF) as u8;
-    image[(offset + 3) as usize] = (value >> 24) as u8;
+static long_name_offsets: [u32; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+
+fn PutHalf(image: *mut u8, offset: usize, value: u32) {
+    image[offset] = (value & 0xFF) as u8;
+    image[offset + 1] = ((value >> 8) & 0xFF) as u8;
 }
 
-fn GetWord(image: *u8, offset: u32) -> u32 {
-    image[offset as usize] as u32 | (image[(offset + 1) as usize] as u32 << 8) |
-        (image[(offset + 2) as usize] as u32 << 16) | (image[(offset + 3) as usize] as u32 << 24)
+fn PutWord(image: *mut u8, offset: usize, value: u32) {
+    PutHalf(image, offset, value & 0xFFFF);
+    PutHalf(image, offset + 2, value >> 16);
 }
 
-fn TableChecksum(image: *u8, count: u32) -> u32 {
-    let length = (HEADER_SIZE + count * ENTRY_SIZE) / 4;
-    let mut sum = CHECKSUM_SEED;
-    let mut i: u32 = 0;
-
-    while i < length {
-        let word = if i == 5 { 0 } else { GetWord(image, i * 4) };
-        sum = ((sum << 5) | (sum >> 27)) ^ word;
-        i += 1;
+fn PutText(image: *mut u8, offset: usize, text: *i8, length: usize) {
+    for i in 0..length {
+        image[offset + i] = text[i] as u8;
     }
-
-    sum
 }
 
-fn FileSize(path: &String) -> i32 {
+fn FileSize(path: &String) -> i64 {
     let mut file = File();
     if file.Open(path, FileMode::Read).IsErr() { return -1; }
 
     match file.Size() {
-        Result<usize, IOError>::Ok(size) => size as i32,
+        Result<usize, IOError>::Ok(size) => size as i64,
         Result<usize, IOError>::Err(_) => -1
     }
 }
@@ -70,18 +70,266 @@ fn ReadInto(path: &String, destination: *mut u8, size: u32) -> bool {
     file.Open(path, FileMode::Read).IsOk() && file.ReadExact(destination, size as usize).IsOk()
 }
 
-fn IsValidName(name: &String) -> bool {
+fn UTF16(name: &String) -> Vector<u16> {
+    let mut units = Vector<u16>();
+    let bytes = name.Data() as *u8;
+    let length = name.Length();
     let mut i: usize = 0;
 
-    while i < name.Length() {
-        if name.Data()[i] == ' ' {
+    while i < length {
+        let first = bytes[i] as u32;
+        let mut code = first;
+        let mut extra: usize = 0;
+
+        if first >= 0xF0 && first < 0xF8 {
+            (code, extra) = (first & 0x07, 3);
+        } else if first >= 0xE0 && first < 0xF0 {
+            (code, extra) = (first & 0x0F, 2);
+        } else if first >= 0xC0 && first < 0xE0 {
+            (code, extra) = (first & 0x1F, 1);
+        }
+
+        let mut valid = i + extra < length;
+        let mut k: usize = 1;
+
+        while valid && k <= extra {
+            let next = bytes[i + k] as u32;
+            valid = (next & 0xC0) == 0x80;
+            code = (code << 6) | (next & 0x3F);
+            k += 1;
+        }
+
+        if !valid {
+            (code, extra) = (first, 0);
+        }
+
+        if code >= 0x10000 {
+            code -= 0x10000;
+            units.PushBack((0xD800 + (code >> 10)) as u16);
+            units.PushBack((0xDC00 + (code & 0x3FF)) as u16);
+        } else {
+            units.PushBack(code as u16);
+        }
+
+        i += extra + 1;
+    }
+
+    units
+}
+
+fn IsShortCharacter(value: u8) -> bool {
+    (value >= ('A' as u8) && value <= ('Z' as u8)) || (value >= ('0' as u8) && value <= ('9' as u8)) || value == ('!' as u8) || value == ('#' as u8) ||
+        value == ('$' as u8) || value == ('%' as u8) || value == ('&' as u8) || value == ('\'' as u8) || value == ('(' as u8) || value == (')' as u8) ||
+        value == ('-' as u8) || value == ('@' as u8) || value == ('^' as u8) || value == ('_' as u8) || value == ('`' as u8) || value == ('{' as u8) ||
+        value == ('}' as u8) || value == ('~' as u8)
+}
+
+fn IsLower(value: u8) -> bool {
+    value >= ('a' as u8) && value <= ('z' as u8)
+}
+
+fn IsUpper(value: u8) -> bool {
+    value >= ('A' as u8) && value <= ('Z' as u8)
+}
+
+fn ToUpper(value: u8) -> u8 {
+    if IsLower(value) { value - 32 } else { value }
+}
+
+fn IsValidName(name: &String) -> bool {
+    let bytes = name.Data() as *u8;
+    let length = name.Length();
+
+    if length == 0 || name == "." || name == ".." || bytes[length - 1] == ('.' as u8) || bytes[length - 1] == (' ' as u8) {
+        return false;
+    }
+
+    for i in 0..length {
+        let value = bytes[i];
+
+        if value < 0x20 || value == ('/' as u8) || value == ('\\' as u8) || value == (':' as u8) || value == ('*' as u8) || value == ('?' as u8) ||
+            value == ('"' as u8) || value == ('<' as u8) || value == ('>' as u8) || value == ('|' as u8) {
             return false;
+        }
+    }
+
+    UTF16(name).Length() <= MAX_NAME_UNITS
+}
+
+fn ShortPart(bytes: *u8, start: usize, end: usize, limit: usize, short: &mut String, case_flag: u8, flags: &mut u8) -> bool {
+    if end - start > limit {
+        return false;
+    }
+
+    let (mut lower, mut upper) = (false, false);
+
+    for i in start..end {
+        let value = bytes[i];
+        (lower, upper) = (lower || IsLower(value), upper || IsUpper(value));
+
+        if !IsShortCharacter(ToUpper(value)) {
+            return false;
+        }
+
+        short += ToUpper(value) as i8;
+    }
+
+    for _ in (end - start)..limit {
+        short += ' ';
+    }
+
+    if lower && upper {
+        return false;
+    }
+
+    if lower {
+        flags |= case_flag;
+    }
+
+    true
+}
+
+fn DirectShortName(name: &String, short: &mut String, flags: &mut u8) -> bool {
+    let bytes = name.Data() as *u8;
+    let length = name.Length();
+    let mut dot = length;
+
+    for i in 0..length {
+        if bytes[i] == ('.' as u8) {
+            if dot != length {
+                return false;
+            }
+
+            dot = i;
+        }
+    }
+
+    short.Clear();
+    flags = 0;
+
+    if dot == 0 || dot == length - 1 {
+        return false;
+    }
+
+    ShortPart(bytes, 0, dot, 8, short, LOWER_BASE, flags) && ShortPart(bytes, if dot < length { dot + 1 } else { length }, length, 3, short, LOWER_EXTENSION, flags)
+}
+
+fn AliasCharacters(bytes: *u8, start: usize, end: usize, limit: usize) -> String {
+    let mut text = String();
+    let mut i = start;
+
+    while i < end && text.Length() < limit {
+        let value = bytes[i];
+
+        if value >= 0x80 {
+            if (value & 0xC0) != 0x80 {
+                text += '_';
+            }
+        } else if value != (' ' as u8) && value != ('.' as u8) {
+            text += (if IsShortCharacter(ToUpper(value)) { ToUpper(value) } else { '_' as u8 }) as i8;
         }
 
         i += 1;
     }
 
-    name.Length() > 0 && name.Length() < NAME_LENGTH as usize
+    text
+}
+
+fn Pad(text: &String, length: usize) -> String {
+    let mut result = text.SubString(0, if text.Length() < length { text.Length() } else { length });
+
+    while result.Length() < length {
+        result += ' ';
+    }
+
+    result
+}
+
+fn MakeAlias(name: &String, existing: &Vector<String>) -> String {
+    let bytes = name.Data() as *u8;
+    let length = name.Length();
+    let mut start: usize = 0;
+
+    while start < length && (bytes[start] == ('.' as u8) || bytes[start] == (' ' as u8)) {
+        start += 1;
+    }
+
+    let mut dot = length;
+
+    for i in start..length {
+        if bytes[i] == ('.' as u8) {
+            dot = i;
+        }
+    }
+
+    let mut base = AliasCharacters(bytes, start, dot, 8);
+    let extension = if dot < length { AliasCharacters(bytes, dot + 1, length, 3) } else { String() };
+
+    if base.Empty() {
+        base = "_".ToString();
+    }
+
+    let mut number: u64 = 1;
+
+    loop {
+        let tail = "~".ToString() + String::FromInteger(number);
+        let keep = if base.Length() + tail.Length() > 8 { 8 - tail.Length() } else { base.Length() };
+        let candidate = Pad(base.SubString(0, keep) + tail, 8) + Pad(extension, 3);
+
+        if !existing.Contains(candidate) {
+            return candidate;
+        }
+
+        number += 1;
+    }
+
+    String()
+}
+
+fn ShortChecksum(short: &String) -> u8 {
+    let mut sum: u32 = 0;
+
+    for i in 0..11 {
+        sum = ((((sum & 1) << 7) + (sum >> 1)) + (short.Data()[i as usize] as u8 as u32)) & 0xFF;
+    }
+
+    sum as u8
+}
+
+fn WriteShortEntry(image: *mut u8, offset: usize, short: &String, attributes: u8, flags: u8, cluster: u32, size: u32) {
+    PutText(image, offset, short.Data(), 11);
+    image[offset + 11] = attributes;
+    image[offset + 12] = flags;
+    PutHalf(image, offset + 16, FAT_DATE);
+    PutHalf(image, offset + 18, FAT_DATE);
+    PutHalf(image, offset + 20, cluster >> 16);
+    PutHalf(image, offset + 24, FAT_DATE);
+    PutHalf(image, offset + 26, cluster & 0xFFFF);
+    PutWord(image, offset + 28, size);
+}
+
+fn LongEntryCount(units: &Vector<u16>) -> usize {
+    (units.Length() + LONG_NAME_CHARACTERS - 1) / LONG_NAME_CHARACTERS
+}
+
+fn WriteLongEntries(image: *mut u8, offset: usize, units: &Vector<u16>, checksum: u8) -> usize {
+    let count = LongEntryCount(units);
+
+    for k in 0..count {
+        let sequence = count - k;
+        let entry = offset + k * ENTRY_SIZE as usize;
+        image[entry] = (sequence | (if k == 0 { 0x40 } else { 0 })) as u8;
+        image[entry + 11] = ATTRIBUTE_LONG_NAME;
+        image[entry + 13] = checksum;
+
+        for j in 0..LONG_NAME_CHARACTERS {
+            let index = (sequence - 1) * LONG_NAME_CHARACTERS + j;
+            let value: u32 = if index < units.Length() { units[index] as u32 } else if index == units.Length() { 0 } else { 0xFFFF };
+            PutHalf(image, entry + long_name_offsets[j] as usize, value);
+        }
+    }
+
+    offset + count * ENTRY_SIZE as usize
 }
 
 class ImageBuilder {
@@ -105,18 +353,18 @@ class ImageBuilder {
         id
     }
 
-    pub fn EnsureDirectory(&mut this, name: &String, parent: u32) -> u32 {
+    pub fn EnsureFolder(&mut this, name: &String, parent: u32) -> u32 {
         let mut i: usize = 0;
 
         while i < this.names.Length() {
-            if this.parents[i] == parent && this.names[i] == name && this.flags[i] == DIRECTORY {
+            if this.parents[i] == parent && this.names[i] == name && this.flags[i] == FOLDER {
                 return this.ids[i];
             }
 
             i += 1;
         }
 
-        this.Add(String(), name, parent, DIRECTORY)
+        this.Add(String(), name, parent, FOLDER)
     }
 
     pub fn EnsurePath(&mut this, path: &String) -> u32 {
@@ -130,7 +378,7 @@ class ImageBuilder {
             if separator {
                 if i > start {
                     let part = path.SubString(start, i - start);
-                    parent = this.EnsureDirectory(part, parent);
+                    parent = this.EnsureFolder(part, parent);
                 }
 
                 start = i + 1;
@@ -142,8 +390,8 @@ class ImageBuilder {
         parent
     }
 
-    pub fn AddContents(&mut this, directory: &String, parent: u32) {
-        let entries = match ListFolder(directory) {
+    pub fn AddContents(&mut this, folder: &String, parent: u32) {
+        let entries = match ListFolder(folder) {
             Result<Vector<FolderEntry>, IOError>::Ok(entries) => entries,
             Result<Vector<FolderEntry>, IOError>::Err(_) => {
                 return;
@@ -154,10 +402,10 @@ class ImageBuilder {
             let name = entry.name;
 
             if name != "vendor" && name != "darwin" && name != "linux" && name != "windows" {
-                let path = JoinPath(directory, name);
+                let path = JoinPath(folder, name);
 
                 if entry.kind == EntryKind::Folder {
-                    this.AddContents(path, this.EnsureDirectory(name, parent));
+                    this.AddContents(path, this.EnsureFolder(name, parent));
                 } else {
                     this.Add(path, name, parent, 0);
                 }
@@ -166,19 +414,487 @@ class ImageBuilder {
     }
 }
 
+class Layout {
+    pub cluster_sectors: u32 = 1,
+    pub fat_sectors: u32 = 0,
+    pub cluster_count: u32 = 0,
+    pub partition_sectors: u32 = 0;
+
+    Layout(&mut this) {}
+
+    pub fn ClusterBytes(&this) -> u32 {
+        this.cluster_sectors * SECTOR_SIZE
+    }
+
+    pub fn ClusterOffset(&this, cluster: u32) -> usize {
+        let sector = PARTITION_START + RESERVED_SECTORS + FAT_COUNT * this.fat_sectors + (cluster - ROOT_CLUSTER) * this.cluster_sectors;
+        sector as usize * SECTOR_SIZE as usize
+    }
+
+    pub fn FatOffset(&this, copy: u32, cluster: u32) -> usize {
+        (PARTITION_START + RESERVED_SECTORS + copy * this.fat_sectors) as usize * SECTOR_SIZE as usize + cluster as usize * 4
+    }
+}
+
+fn MakeLayout(megabytes: u32) -> Layout {
+    let mut layout = Layout();
+    layout.partition_sectors = megabytes * 2048 - PARTITION_START;
+    layout.cluster_sectors = if megabytes <= 260 { 1 } else { 8 };
+    let mut fat: u32 = 1;
+
+    loop {
+        let clusters = (layout.partition_sectors - RESERVED_SECTORS - FAT_COUNT * fat) / layout.cluster_sectors;
+        let needed = ((clusters + 2) * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+
+        if needed <= fat {
+            (layout.fat_sectors, layout.cluster_count) = (fat, clusters);
+            return layout;
+        }
+
+        fat = needed;
+    }
+
+    layout
+}
+
+fn WriteBootSector(image: *mut u8, sector: u32, layout: &Layout) {
+    let offset = sector as usize * SECTOR_SIZE as usize;
+    image[offset] = 0xEB;
+    image[offset + 1] = 0x58;
+    image[offset + 2] = 0x90;
+    PutText(image, offset + 3, "TRIGLAV ", 8);
+    PutHalf(image, offset + 11, SECTOR_SIZE);
+    image[offset + 13] = layout.cluster_sectors as u8;
+    PutHalf(image, offset + 14, RESERVED_SECTORS);
+    image[offset + 16] = FAT_COUNT as u8;
+    image[offset + 21] = 0xF8;
+    PutHalf(image, offset + 24, 63);
+    PutHalf(image, offset + 26, 255);
+    PutWord(image, offset + 28, PARTITION_START);
+    PutWord(image, offset + 32, layout.partition_sectors);
+    PutWord(image, offset + 36, layout.fat_sectors);
+    PutWord(image, offset + 44, ROOT_CLUSTER);
+    PutHalf(image, offset + 48, 1);
+    PutHalf(image, offset + 50, 6);
+    image[offset + 64] = 0x80;
+    image[offset + 66] = 0x29;
+    PutWord(image, offset + 67, VOLUME_ID);
+    PutText(image, offset + 71, "TRIGLAV    ", 11);
+    PutText(image, offset + 82, "FAT32   ", 8);
+    image[offset + 510] = 0x55;
+    image[offset + 511] = 0xAA;
+}
+
+fn WriteInformationSector(image: *mut u8, sector: u32, free: u32, next: u32) {
+    let offset = sector as usize * SECTOR_SIZE as usize;
+    PutWord(image, offset, 0x41615252);
+    PutWord(image, offset + 484, 0x61417272);
+    PutWord(image, offset + 488, free);
+    PutWord(image, offset + 492, next);
+    PutWord(image, offset + 508, 0xAA550000);
+}
+
+fn WriteMasterBootRecord(image: *mut u8, layout: &Layout) {
+    let entry: usize = 446;
+    image[entry + 1] = 0xFE;
+    image[entry + 2] = 0xFF;
+    image[entry + 3] = 0xFF;
+    image[entry + 4] = 0x0C;
+    image[entry + 5] = 0xFE;
+    image[entry + 6] = 0xFF;
+    image[entry + 7] = 0xFF;
+    PutWord(image, entry + 8, PARTITION_START);
+    PutWord(image, entry + 12, layout.partition_sectors);
+    image[510] = 0x55;
+    image[511] = 0xAA;
+}
+
+fn SetChain(image: *mut u8, layout: &Layout, first: u32, count: u32) {
+    for k in 0..count {
+        let value = if k + 1 == count { END_OF_CHAIN } else { first + k + 1 };
+
+        for copy in 0..FAT_COUNT {
+            PutWord(image, layout.FatOffset(copy, first + k), value);
+        }
+    }
+}
+
+const EXFAT_FAT_OFFSET: u32 = 128;
+const EXFAT_BITMAP_CLUSTER: u32 = 2;
+const EXFAT_NAME_CHARACTERS: usize = 15;
+
+fn Upcase(value: u32) -> u32 {
+    if (value >= 0x61 && value <= 0x7A) || (value >= 0xE0 && value <= 0xFE && value != 0xF7) {
+        value - 0x20
+    } else if value == 0xFF {
+        0x178
+    } else if (value >= 0x100 && value <= 0x12F) || (value >= 0x132 && value <= 0x137) || (value >= 0x14A && value <= 0x177) {
+        if (value & 1) != 0 { value - 1 } else { value }
+    } else if (value >= 0x139 && value <= 0x148) || (value >= 0x179 && value <= 0x17E) {
+        if (value & 1) == 0 { value - 1 } else { value }
+    } else {
+        value
+    }
+}
+
+fn UpcaseTable() -> Vector<u16> {
+    let mut table = Vector<u16>();
+    let mut value: u32 = 0;
+
+    while value < 0x10000 {
+        if Upcase(value) != value {
+            table.PushBack(Upcase(value) as u16);
+            value += 1;
+            continue;
+        }
+
+        let mut run: u32 = 0;
+
+        while value + run < 0x10000 && Upcase(value + run) == value + run {
+            run += 1;
+        }
+
+        table.PushBack(0xFFFF);
+        table.PushBack(run as u16);
+        value += run;
+    }
+
+    table
+}
+
+fn Checksum32(data: *u8, length: usize, skip_boot_fields: bool) -> u32 {
+    let mut sum: u32 = 0;
+
+    for i in 0..length {
+        if skip_boot_fields && (i == 106 || i == 107 || i == 112) {
+            continue;
+        }
+
+        sum = (if (sum & 1) != 0 { 0x80000000 } else { 0 }) + (sum >> 1) + data[i] as u32;
+    }
+
+    sum
+}
+
+fn Checksum16(data: *u8, length: usize) -> u32 {
+    let mut sum: u32 = 0;
+
+    for i in 0..length {
+        if i == 2 || i == 3 {
+            continue;
+        }
+
+        sum = ((if (sum & 1) != 0 { 0x8000 } else { 0 }) + (sum >> 1) + data[i] as u32) & 0xFFFF;
+    }
+
+    sum
+}
+
+fn NameHash(units: &Vector<u16>) -> u32 {
+    let mut hash: u32 = 0;
+
+    for unit in units {
+        let upper = Upcase(unit as u32);
+        hash = ((if (hash & 1) != 0 { 0x8000 } else { 0 }) + (hash >> 1) + (upper & 0xFF)) & 0xFFFF;
+        hash = ((if (hash & 1) != 0 { 0x8000 } else { 0 }) + (hash >> 1) + (upper >> 8)) & 0xFFFF;
+    }
+
+    hash
+}
+
+class ExFATLayout {
+    pub cluster_shift: u32 = 3,
+    pub fat_sectors: u32 = 0,
+    pub heap_offset: u32 = 0,
+    pub cluster_count: u32 = 0,
+    pub partition_sectors: u32 = 0;
+
+    ExFATLayout(&mut this) {}
+
+    pub fn ClusterSectors(&this) -> u32 {
+        1u32 << this.cluster_shift
+    }
+
+    pub fn ClusterBytes(&this) -> u32 {
+        this.ClusterSectors() * SECTOR_SIZE
+    }
+
+    pub fn ClusterOffset(&this, cluster: u32) -> usize {
+        (PARTITION_START + this.heap_offset + (cluster - 2) * this.ClusterSectors()) as usize * SECTOR_SIZE as usize
+    }
+
+    pub fn FatOffset(&this, cluster: u32) -> usize {
+        (PARTITION_START + EXFAT_FAT_OFFSET) as usize * SECTOR_SIZE as usize + cluster as usize * 4
+    }
+}
+
+fn MakeExFATLayout(megabytes: u32) -> ExFATLayout {
+    let mut layout = ExFATLayout();
+    layout.partition_sectors = megabytes * 2048 - PARTITION_START;
+    layout.cluster_shift = if megabytes <= 256 { 3 } else { 6 };
+    let spc = layout.ClusterSectors();
+    let mut fat: u32 = 1;
+
+    loop {
+        let heap = (EXFAT_FAT_OFFSET + fat + spc - 1) / spc * spc;
+        let clusters = (layout.partition_sectors - heap) / spc;
+        let needed = ((clusters + 2) * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+
+        if needed <= fat {
+            (layout.fat_sectors, layout.heap_offset, layout.cluster_count) = (fat, heap, clusters);
+            return layout;
+        }
+
+        fat = needed;
+    }
+
+    layout
+}
+
+fn ExFATSetEntries(name: &String) -> u32 {
+    2 + ((UTF16(name).Length() + EXFAT_NAME_CHARACTERS - 1) / EXFAT_NAME_CHARACTERS) as u32
+}
+
+fn WriteExFATSet(image: *mut u8, offset: usize, name: &String, attributes: u32, cluster: u32, length: u32, contiguous: bool) -> usize {
+    let units = UTF16(name);
+    let names = (units.Length() + EXFAT_NAME_CHARACTERS - 1) / EXFAT_NAME_CHARACTERS;
+    let count = 2 + names;
+    image[offset] = 0x85;
+    image[offset + 1] = (count - 1) as u8;
+    PutHalf(image, offset + 4, attributes);
+    PutWord(image, offset + 8, FAT_DATE << 16);
+    PutWord(image, offset + 12, FAT_DATE << 16);
+    PutWord(image, offset + 16, FAT_DATE << 16);
+    let stream = offset + 32;
+    image[stream] = 0xC0;
+    let mut flags: u32 = 0;
+
+    if cluster != 0 {
+        flags = if contiguous { 3 } else { 1 };
+    }
+
+    image[stream + 1] = flags as u8;
+    image[stream + 3] = units.Length() as u8;
+    PutHalf(image, stream + 4, NameHash(units));
+    PutWord(image, stream + 8, length);
+    PutWord(image, stream + 20, cluster);
+    PutWord(image, stream + 24, length);
+
+    for k in 0..names {
+        let entry = offset + (2 + k) * 32;
+        image[entry] = 0xC1;
+
+        for j in 0..EXFAT_NAME_CHARACTERS {
+            let index = k * EXFAT_NAME_CHARACTERS + j;
+            PutHalf(image, entry + 2 + j * 2, if index < units.Length() { units[index] as u32 } else { 0 });
+        }
+    }
+
+    PutHalf(image, offset + 2, Checksum16(image + offset, count * 32));
+    offset + count * 32
+}
+
+fn WriteExFATChain(image: *mut u8, layout: &ExFATLayout, first: u32, length: u32) {
+    for k in 0..length {
+        PutWord(image, layout.FatOffset(first + k), if k + 1 == length { 0xFFFFFFFF } else { first + k + 1 });
+    }
+}
+
+fn SetBit(image: *mut u8, base: usize, cluster: u32) {
+    let index = (cluster - 2) as usize;
+    image[base + index / 8] = image[base + index / 8] | (1u8 << (index % 8) as u8);
+}
+
+fn WriteExFAT(builder: &ImageBuilder, sizes: &Vector<u32>, megabytes: u32, output: &String) -> i32 {
+    let layout = MakeExFATLayout(megabytes);
+    let count = builder.names.Length();
+    let cluster_bytes = layout.ClusterBytes();
+    let upcase = UpcaseTable();
+    let upcase_bytes = (upcase.Length() * 2) as u32;
+    let bitmap_bytes = (layout.cluster_count + 7) / 8;
+    let mut entry_counts = Vector<u32>();
+    entry_counts.Resize(count + 1);
+    entry_counts[0] = 3;
+
+    for index in 0..count {
+        entry_counts[builder.parents[index] as usize] += ExFATSetEntries(builder.names[index]);
+    }
+
+    let mut first_clusters = Vector<u32>();
+    let mut cluster_counts = Vector<u32>();
+    let bitmap_clusters = (bitmap_bytes + cluster_bytes - 1) / cluster_bytes;
+    let upcase_cluster = EXFAT_BITMAP_CLUSTER + bitmap_clusters;
+    let upcase_clusters = (upcase_bytes + cluster_bytes - 1) / cluster_bytes;
+    let root_cluster = upcase_cluster + upcase_clusters;
+    let root_count = (entry_counts[0] * 32 + cluster_bytes - 1) / cluster_bytes;
+    let mut next_cluster = root_cluster + root_count;
+
+    for index in 0..count {
+        let folder = builder.flags[index] == FOLDER;
+        let bytes = if folder { entry_counts[index + 1] * 32 } else { sizes[index] };
+        let mut clusters = (bytes + cluster_bytes - 1) / cluster_bytes;
+
+        if folder && clusters == 0 {
+            clusters = 1;
+        }
+
+        if next_cluster + clusters > layout.cluster_count + 2 {
+            WriteLine("The files do not fit in " + String::FromInteger(megabytes as u64) + " megabytes.");
+            return 1;
+        }
+
+        first_clusters.PushBack(if clusters == 0 { 0 } else { next_cluster });
+        cluster_counts.PushBack(clusters);
+        next_cluster += clusters;
+    }
+
+    let total = megabytes as usize * 1048576;
+    let image = new u8[total];
+
+    for j in 0..total {
+        image[j] = 0;
+    }
+
+    let mbr: usize = 446;
+    image[mbr + 1] = 0xFE;
+    image[mbr + 2] = 0xFF;
+    image[mbr + 3] = 0xFF;
+    image[mbr + 4] = 0x07;
+    image[mbr + 5] = 0xFE;
+    image[mbr + 6] = 0xFF;
+    image[mbr + 7] = 0xFF;
+    PutWord(image, mbr + 8, PARTITION_START);
+    PutWord(image, mbr + 12, layout.partition_sectors);
+    image[510] = 0x55;
+    image[511] = 0xAA;
+
+    let boot = PARTITION_START as usize * SECTOR_SIZE as usize;
+    image[boot] = 0xEB;
+    image[boot + 1] = 0x76;
+    image[boot + 2] = 0x90;
+    PutText(image, boot + 3, "EXFAT   ", 8);
+    PutWord(image, boot + 64, PARTITION_START);
+    PutWord(image, boot + 72, layout.partition_sectors);
+    PutWord(image, boot + 80, EXFAT_FAT_OFFSET);
+    PutWord(image, boot + 84, layout.fat_sectors);
+    PutWord(image, boot + 88, layout.heap_offset);
+    PutWord(image, boot + 92, layout.cluster_count);
+    PutWord(image, boot + 96, root_cluster);
+    PutWord(image, boot + 100, VOLUME_ID);
+    PutHalf(image, boot + 104, 0x0100);
+    image[boot + 108] = 9;
+    image[boot + 109] = layout.cluster_shift as u8;
+    image[boot + 110] = 1;
+    image[boot + 111] = 0x80;
+    image[boot + 112] = ((next_cluster - 2) * 100 / layout.cluster_count) as u8;
+    image[boot + 510] = 0x55;
+    image[boot + 511] = 0xAA;
+
+    for sector in 1..(9 as usize) {
+        PutWord(image, boot + sector * 512 + 508, 0xAA550000);
+    }
+
+    let checksum = Checksum32(image + boot, 11 * 512, true);
+
+    for k in 0..(128 as usize) {
+        PutWord(image, boot + 11 * 512 + k * 4, checksum);
+    }
+
+    for j in 0..(12 * 512 as usize) {
+        image[boot + 12 * 512 + j] = image[boot + j];
+    }
+
+    PutWord(image, layout.FatOffset(0), 0xFFFFFFF8);
+    PutWord(image, layout.FatOffset(1), 0xFFFFFFFF);
+
+    WriteExFATChain(image, layout, EXFAT_BITMAP_CLUSTER, bitmap_clusters);
+    WriteExFATChain(image, layout, upcase_cluster, upcase_clusters);
+    WriteExFATChain(image, layout, root_cluster, root_count);
+
+    let bitmap = layout.ClusterOffset(EXFAT_BITMAP_CLUSTER);
+
+    for cluster in 2..next_cluster {
+        SetBit(image, bitmap, cluster);
+    }
+
+    let table = layout.ClusterOffset(upcase_cluster);
+
+    for k in 0..upcase.Length() {
+        PutHalf(image, table + k * 2, upcase[k] as u32);
+    }
+
+    let root = layout.ClusterOffset(root_cluster);
+    let label = "TRIGLAV".ToString();
+    image[root] = 0x83;
+    image[root + 1] = label.Length() as u8;
+
+    for k in 0..label.Length() {
+        PutHalf(image, root + 2 + k * 2, label.Data()[k] as u32);
+    }
+
+    image[root + 32] = 0x81;
+    PutWord(image, root + 32 + 20, EXFAT_BITMAP_CLUSTER);
+    PutWord(image, root + 32 + 24, bitmap_bytes);
+    image[root + 64] = 0x82;
+    PutWord(image, root + 64 + 4, Checksum32(image + table, upcase_bytes as usize, false));
+    PutWord(image, root + 64 + 20, upcase_cluster);
+    PutWord(image, root + 64 + 24, upcase_bytes);
+
+    for folder in 0..(count + 1) {
+        if folder != 0 && builder.flags[folder - 1] != FOLDER {
+            continue;
+        }
+
+        let mut offset = if folder == 0 { root + 96 } else { layout.ClusterOffset(first_clusters[folder - 1]) };
+
+        for index in 0..count {
+            if builder.parents[index] as usize != folder {
+                continue;
+            }
+
+            let is_folder = builder.flags[index] == FOLDER;
+            let length = if is_folder { cluster_counts[index] * cluster_bytes } else { sizes[index] };
+            offset = WriteExFATSet(image, offset, builder.names[index], if is_folder { ATTRIBUTE_FOLDER as u32 } else { ATTRIBUTE_ARCHIVE as u32 },
+                first_clusters[index], length, true);
+        }
+    }
+
+    for index in 0..count {
+        if builder.flags[index] != FOLDER && sizes[index] > 0 &&
+            !ReadInto(builder.paths[index], image + layout.ClusterOffset(first_clusters[index]), sizes[index]) {
+            WriteLine("Cannot read '" + builder.paths[index] + "'.");
+            return 1;
+        }
+    }
+
+    let mut file = File();
+
+    if file.Open(output, FileMode::Write).IsErr() || file.Write(image as *u8, total).IsErr() || file.Close().IsErr() {
+        WriteLine("Cannot write '" + output + "'.");
+        return 1;
+    }
+
+    WriteLine("Packed " + String::FromInteger(count as u64) + " entries into a " + String::FromInteger(megabytes as u64) + " MB exFAT image, " +
+        String::FromInteger(((next_cluster - 2) * cluster_bytes / 1024) as u64) + " KB used.");
+    0
+}
+
 fn PrintUsage(executable: String) {
-    WriteLine("OVERVIEW: Packs files and directories into a Triglav file system image");
+    WriteLine("OVERVIEW: Packs files and folders into a FAT32 or exFAT image of an SD card");
     WriteLine("USAGE: " + executable + " [options] -o <image> <inputs...>");
-    WriteLine("A file goes into the root directory, so does what is inside a directory.");
+    WriteLine("A file goes into the root folder, so does what is inside a folder.");
+    WriteLine("<name>=<path> puts a file or the contents of a folder at <name>.");
     WriteLine("OPTIONS:");
-    WriteLine("  --blocks=<count>         Make a file system of <count> blocks of 4096 bytes, 256 by default");
+    WriteLine("  --size=<megabytes>       Make an image of <megabytes>, 64 by default, 33 to 2048 for FAT32");
+    WriteLine("  --exfat                  Make an exFAT file system instead of FAT32");
 }
 
 fn Main(args: &mut Vector<String>) -> i32 {
     let (_, executable) = SplitPath(args[0]);
     let mut output = String();
     let mut builder = ImageBuilder();
-    let mut block_count = DEFAULT_BLOCKS;
+    let mut megabytes = DEFAULT_MEGABYTES;
+    let mut exfat = false;
     let mut i: usize = 1;
 
     while i < args.Length() {
@@ -187,8 +903,10 @@ fn Main(args: &mut Vector<String>) -> i32 {
         if arg == "--help" || arg == "-h" {
             PrintUsage(executable);
             return 0;
-        } else if arg.StartsWith("--blocks=") {
-            block_count = String::ToInteger(arg.SubString(9), 10).Unwrap() as u32;
+        } else if arg == "--exfat" {
+            exfat = true;
+        } else if arg.StartsWith("--size=") {
+            megabytes = String::ToInteger(arg.SubString(7), 10).UnwrapOr(0) as u32;
         } else if arg == "-o" {
             i += 1;
 
@@ -206,8 +924,8 @@ fn Main(args: &mut Vector<String>) -> i32 {
                 let parent = builder.EnsurePath(target);
                 builder.AddContents(source, parent);
             } else if FileExists(source) {
-                let (directory, name) = SplitPath(target);
-                let parent = builder.EnsurePath(directory);
+                let (folder, name) = SplitPath(target);
+                let parent = builder.EnsurePath(folder);
                 builder.Add(source, name, parent, 0);
             } else {
                 WriteLine("Cannot find '" + source + "'.");
@@ -231,110 +949,198 @@ fn Main(args: &mut Vector<String>) -> i32 {
         return 1;
     }
 
-    if block_count <= TABLE_BLOCKS || block_count > MAX_BLOCKS {
-        WriteLine("The file system must have 3 to 1536 blocks.");
+    if megabytes > MAX_MEGABYTES {
+        WriteLine("The image can be at most " + String::FromInteger(MAX_MEGABYTES as u64) + " megabytes.");
         return 1;
     }
 
-    let count = builder.paths.Length() as u32;
+    let layout = MakeLayout(if megabytes < 2 { 2 } else { megabytes });
 
-    if count > MAX_ENTRIES {
-        WriteLine("There can be at most 63 files and directories.");
+    if megabytes < 2 || (!exfat && layout.cluster_count < MIN_CLUSTERS) {
+        WriteLine(if exfat { "The image needs at least 2 megabytes." } else { "The image is too small for FAT32, it needs at least 33 megabytes." });
         return 1;
     }
 
-    let total = block_count * BLOCK_SIZE;
-    let image = new u8[total as usize];
-    let mut j: u32 = 0;
+    let count = builder.names.Length();
+    let cluster_bytes = layout.ClusterBytes();
+    let mut sizes = Vector<u32>();
+    let mut short_names = Vector<String>();
+    let mut case_flags = Vector<u8>();
+    let mut long_names = Vector<bool>();
+    let mut first_clusters = Vector<u32>();
+    let mut cluster_counts = Vector<u32>();
 
-    while j < total {
-        image[j as usize] = 0xFF;
-        j += 1;
-    }
-
-    j = 0;
-
-    while j < HEADER_SIZE + count * ENTRY_SIZE {
-        image[j as usize] = 0;
-        j += 1;
-    }
-
-    let mut next_block = TABLE_BLOCKS;
-    let mut index: u32 = 0;
-
-    while index < count {
-        let (path, name) = (builder.paths[index as usize], builder.names[index as usize]);
-        let directory = builder.flags[index as usize] == DIRECTORY;
+    for index in 0..count {
+        let name = builder.names[index];
 
         if !IsValidName(name) {
-            WriteLine("The name '" + name + "' must have 1 to 31 characters without spaces.");
+            WriteLine("The name '" + name + "' is not allowed on FAT32.");
             return 1;
         }
 
-        let size = if directory { 0 } else { FileSize(path) };
+        let mut size: u32 = 0;
 
-        if size < 0 {
-            WriteLine("Cannot open '" + path + "'.");
-            return 1;
+        if builder.flags[index] != FOLDER {
+            let length = FileSize(builder.paths[index]);
+
+            if length < 0 || length > 0xFFFFFFFF {
+                WriteLine("Cannot open '" + builder.paths[index] + "'.");
+                return 1;
+            }
+
+            size = length as u32;
         }
 
-        let blocks = (size as u32 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        let first = if blocks == 0 { 0 } else { next_block };
-
-        if next_block + blocks > block_count {
-            WriteLine("The files do not fit in " + String::FromInteger(block_count as u64) + " blocks.");
-            return 1;
-        }
-
-        let entry = HEADER_SIZE + index * ENTRY_SIZE;
-        let mut k: usize = 0;
-
-        while k < name.Length() {
-            image[entry as usize + k] = name.Data()[k] as u8;
-            k += 1;
-        }
-
-        PutWord(image, entry + NAME_LENGTH, first);
-        PutWord(image, entry + NAME_LENGTH + 4, size as u32);
-        PutWord(image, entry + NAME_LENGTH + 8, builder.ids[index as usize]);
-        PutWord(image, entry + NAME_LENGTH + 12, builder.parents[index as usize]);
-        PutWord(image, entry + NAME_LENGTH + 16, builder.flags[index as usize]);
-
-        if size > 0 && !ReadInto(path, image + (first * BLOCK_SIZE) as usize, size as u32) {
-            WriteLine("Cannot read '" + path + "'.");
-            return 1;
-        }
-
-        next_block += blocks;
-        index += 1;
+        sizes.PushBack(size);
+        short_names.PushBack(String());
+        case_flags.PushBack(0);
+        long_names.PushBack(false);
+        first_clusters.PushBack(0);
+        cluster_counts.PushBack(0);
     }
 
-    PutWord(image, 0, IMAGE_MAGIC);
-    PutWord(image, 4, IMAGE_VERSION);
-    PutWord(image, 8, 1);
-    PutWord(image, 12, count);
-    PutWord(image, 16, block_count);
-    PutWord(image, 24, builder.next_id);
-    PutWord(image, 28, next_block);
-    PutWord(image, 20, TableChecksum(image, count));
-    j = 0;
+    if exfat {
+        return WriteExFAT(builder, sizes, megabytes, output);
+    }
 
-    while j < total {
-        let (b0, b1) = (image[j as usize], image[(j + 1) as usize]);
-        image[j as usize] = image[(j + 3) as usize];
-        image[(j + 1) as usize] = image[(j + 2) as usize];
-        image[(j + 2) as usize] = b1;
-        image[(j + 3) as usize] = b0;
-        j += 4;
+    let mut entry_counts = Vector<u32>();
+    entry_counts.Resize(count + 1);
+
+    for folder in 0..(count + 1) {
+        let id = folder as u32;
+        let mut taken = Vector<String>();
+        let mut entries: u32 = if id == 0 { 0 } else { 2 };
+
+        if id != 0 && builder.flags[folder - 1] != FOLDER {
+            continue;
+        }
+
+        for index in 0..count {
+            if builder.parents[index] != id {
+                continue;
+            }
+
+            let name = builder.names[index];
+            let mut short = String();
+            let mut flags: u8 = 0;
+
+            if DirectShortName(name, short, flags) && !taken.Contains(short) {
+                (short_names[index], case_flags[index]) = (short, flags);
+                entries += 1;
+            } else {
+                short_names[index] = MakeAlias(name, taken);
+                long_names[index] = true;
+                entries += 1 + LongEntryCount(UTF16(name)) as u32;
+            }
+
+            taken.PushBack(short_names[index]);
+        }
+
+        entry_counts[folder] = entries;
+    }
+
+    let mut next_cluster = ROOT_CLUSTER;
+    let root_clusters = (entry_counts[0] * ENTRY_SIZE + cluster_bytes - 1) / cluster_bytes;
+    let root_count = if root_clusters == 0 { 1 } else { root_clusters };
+    next_cluster += root_count;
+
+    for index in 0..count {
+        let bytes = if builder.flags[index] == FOLDER { entry_counts[index + 1] * ENTRY_SIZE } else { sizes[index] };
+        let mut clusters = (bytes + cluster_bytes - 1) / cluster_bytes;
+
+        if builder.flags[index] == FOLDER && clusters == 0 {
+            clusters = 1;
+        }
+
+        if next_cluster + clusters > layout.cluster_count + ROOT_CLUSTER {
+            WriteLine("The files do not fit in " + String::FromInteger(megabytes as u64) + " megabytes.");
+            return 1;
+        }
+
+        first_clusters[index] = if clusters == 0 { 0 } else { next_cluster };
+        cluster_counts[index] = clusters;
+        next_cluster += clusters;
+    }
+
+    let total = megabytes as usize * 1048576;
+    let image = new u8[total];
+
+    for j in 0..total {
+        image[j] = 0;
+    }
+
+    WriteMasterBootRecord(image, layout);
+    WriteBootSector(image, PARTITION_START, layout);
+    WriteBootSector(image, PARTITION_START + 6, layout);
+    let free = layout.cluster_count + ROOT_CLUSTER - next_cluster;
+    WriteInformationSector(image, PARTITION_START + 1, free, next_cluster);
+    WriteInformationSector(image, PARTITION_START + 7, free, next_cluster);
+
+    for copy in 0..FAT_COUNT {
+        PutWord(image, layout.FatOffset(copy, 0), 0x0FFFFFF8);
+        PutWord(image, layout.FatOffset(copy, 1), 0x0FFFFFFF);
+    }
+
+    SetChain(image, layout, ROOT_CLUSTER, root_count);
+
+    for index in 0..count {
+        if cluster_counts[index] > 0 {
+            SetChain(image, layout, first_clusters[index], cluster_counts[index]);
+        }
+    }
+
+    for folder in 0..(count + 1) {
+        let id = folder as u32;
+
+        if id != 0 && builder.flags[folder - 1] != FOLDER {
+            continue;
+        }
+
+        let cluster = if id == 0 { ROOT_CLUSTER } else { first_clusters[folder - 1] };
+        let mut offset = layout.ClusterOffset(cluster);
+
+        if id != 0 {
+            let parent = builder.parents[folder - 1];
+            let parent_cluster = if parent == 0 { 0 } else { first_clusters[parent as usize - 1] };
+            WriteShortEntry(image, offset, ".          ".ToString(), ATTRIBUTE_FOLDER, 0, cluster, 0);
+            WriteShortEntry(image, offset + ENTRY_SIZE as usize, "..         ".ToString(), ATTRIBUTE_FOLDER, 0, parent_cluster, 0);
+            offset += 2 * ENTRY_SIZE as usize;
+        }
+
+        for index in 0..count {
+            if builder.parents[index] != id {
+                continue;
+            }
+
+            let short = short_names[index];
+
+            if long_names[index] {
+                offset = WriteLongEntries(image, offset, UTF16(builder.names[index]), ShortChecksum(short));
+            }
+
+            let is_folder = builder.flags[index] == FOLDER;
+            WriteShortEntry(image, offset, short, if is_folder { ATTRIBUTE_FOLDER } else { ATTRIBUTE_ARCHIVE }, case_flags[index],
+                first_clusters[index], if is_folder { 0 } else { sizes[index] });
+            offset += ENTRY_SIZE as usize;
+        }
+    }
+
+    for index in 0..count {
+        if builder.flags[index] != FOLDER && sizes[index] > 0 &&
+            !ReadInto(builder.paths[index], image + layout.ClusterOffset(first_clusters[index]), sizes[index]) {
+            WriteLine("Cannot read '" + builder.paths[index] + "'.");
+            return 1;
+        }
     }
 
     let mut file = File();
 
-    if file.Open(output, FileMode::Write).IsErr() || file.Write(image as *u8, total as usize).IsErr() || file.Close().IsErr() {
+    if file.Open(output, FileMode::Write).IsErr() || file.Write(image as *u8, total).IsErr() || file.Close().IsErr() {
         WriteLine("Cannot write '" + output + "'.");
         return 1;
     }
 
-    WriteLine("Packed " + String::FromInteger(count as u64) + " entries into " + String::FromInteger(block_count as u64) + " blocks.");
+    WriteLine("Packed " + String::FromInteger(count as u64) + " entries into a " + String::FromInteger(megabytes as u64) + " MB FAT32 image, " +
+        String::FromInteger(((next_cluster - ROOT_CLUSTER) * cluster_bytes / 1024) as u64) + " KB used.");
     0
 }

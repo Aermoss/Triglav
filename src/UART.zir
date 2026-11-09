@@ -1,0 +1,47 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Devices.zir" : *]
+
+const UART_RX_READY: u32 = 1;
+const UART_TX_BUSY: u32 = 2;
+
+struct UARTPort {
+    pub data: u32,
+    pub status: u32,
+    pub divisor: u32
+}
+
+fn MakeUARTPort(data: u32, status: u32, divisor: u32) -> UARTPort {
+    UARTPort { data: data, status: status, divisor: divisor }
+}
+
+fn UARTSetBaudRate(port: *UARTPort, baud: u32) {
+    *(port->divisor as *mut u32) = CLK_FREQ / baud;
+}
+
+fn UARTHasByte(port: *UARTPort) -> bool {
+    (*(port->status as *u32) & UART_RX_READY) != 0
+}
+
+fn UARTRead(port: *UARTPort) -> u8 {
+    *(port->data as *u8)
+}
+
+fn UARTWrite(port: *UARTPort, value: u8) {
+    while (*(port->status as *u32) & UART_TX_BUSY) != 0 {}
+    *(port->data as *mut u8) = value;
+}

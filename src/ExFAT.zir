@@ -1,0 +1,577 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Volume.zir" : *]
+
+const EXFAT_FILE: u32 = 0x85;
+const EXFAT_STREAM: u32 = 0xC0;
+const EXFAT_NAME: u32 = 0xC1;
+const EXFAT_BITMAP: u32 = 0x81;
+const EXFAT_UPCASE: u32 = 0x82;
+const EXFAT_NAME_CHARACTERS: u32 = 15;
+const EXFAT_MAX_SET: u32 = 19;
+const EXFAT_END_OF_CHAIN: u32 = 0xFFFFFFFF;
+
+static mut bitmap_file: FileInfo;
+static mut bitmap_buffer: [u8; 512];
+static mut cached_bitmap_sector: u32 = 0xFFFFFFFF;
+static mut bitmap_dirty: bool = false;
+static mut set_buffer: [u8; 608];
+
+fn FlushBitmap() -> bool {
+    if bitmap_dirty {
+        if !SDWriteSectors(cached_bitmap_sector, 1, &bitmap_buffer[0] as *u8) {
+            io_failed = true;
+            return false;
+        }
+
+        bitmap_dirty = false;
+    }
+
+    true
+}
+
+fn BitmapByte(cluster: u32) -> *mut u8 {
+    let byte = (cluster - 2) / 8;
+    let holder = ClusterAt(&mut bitmap_file, byte / cluster_bytes);
+
+    if holder == 0 {
+        io_failed = true;
+        return null;
+    }
+
+    let sector = ClusterSector(holder) + (byte % cluster_bytes) / SECTOR_SIZE;
+
+    if cached_bitmap_sector != sector {
+        if !FlushBitmap() {
+            return null;
+        }
+
+        if !SDReadSectors(sector, 1, &mut bitmap_buffer[0]) {
+            cached_bitmap_sector = NO_SECTOR;
+            io_failed = true;
+            return null;
+        }
+
+        cached_bitmap_sector = sector;
+    }
+
+    &mut bitmap_buffer[(byte % SECTOR_SIZE) as usize]
+}
+
+fn ExFATIsClusterFree(cluster: u32) -> bool {
+    let byte = BitmapByte(cluster);
+    byte != null && ((*byte as u32 >> ((cluster - 2) % 8)) & 1) == 0
+}
+
+fn ExFATSetClusterUsed(cluster: u32, used: bool) -> bool {
+    let byte = BitmapByte(cluster);
+
+    if byte == null {
+        return false;
+    }
+
+    let mask = 1u32 << ((cluster - 2) % 8);
+    *byte = (if used { *byte as u32 | mask } else { *byte as u32 & !mask }) as u8;
+    bitmap_dirty = true;
+    true
+}
+
+fn IsExFATBootSector(sector: *u8) -> bool {
+    sector[3] == ('E' as u8) && sector[4] == ('X' as u8) && sector[5] == ('F' as u8) && sector[6] == ('A' as u8) && sector[7] == ('T' as u8) &&
+        sector[8] == (' ' as u8) && sector[9] == (' ' as u8) && sector[10] == (' ' as u8) && sector[510] == 0x55 && sector[511] == 0xAA
+}
+
+fn LoadUpcase(first: u32, length: u32) {
+    if upcase_table == null {
+        upcase_table = Allocate(131072) as *mut u16;
+    }
+
+    if upcase_table == null {
+        return;
+    }
+
+    let mut i: u32 = 0;
+
+    while i < 65536 {
+        upcase_table[i as usize] = DefaultUpcase(i) as u16;
+        i += 1;
+    }
+
+    if !IsValidCluster(first) || length < 2 || length > 262144 {
+        return;
+    }
+
+    let data = Allocate(length);
+
+    if data == null {
+        return;
+    }
+
+    RootInfo(&mut scratch_other);
+    (scratch_other.first_cluster, scratch_other.size, scratch_other.data_length, scratch_other.cursor_cluster) = (first, length, length, first);
+
+    if ReadData(&mut scratch_other, 0, data, length) == length {
+        let count = length / 2;
+        let (mut k, mut index): (u32, u32) = (0, 0);
+
+        while k < count && index < 65536 {
+            let unit = GetHalf(data as *u8 + (k * 2) as usize);
+
+            if unit == 0xFFFF && k + 1 < count {
+                index += GetHalf(data as *u8 + ((k + 1) * 2) as usize);
+                k += 2;
+            } else {
+                upcase_table[index as usize] = unit as u16;
+                index += 1;
+                k += 1;
+            }
+        }
+    }
+
+    Free(data);
+}
+
+fn ExFATMount(start: u32, boot: *u8) -> bool {
+    let copies = boot[110] as u32;
+    let shift = boot[109] as u32;
+
+    if boot[108] != 9 || copies == 0 || copies > 2 || shift > 16 || GetWord(boot + 76) != 0 {
+        return false;
+    }
+
+    let active = if copies == 2 { GetHalf(boot + 106) & 1 } else { 0 };
+    let (offset, length) = (GetWord(boot + 80), GetWord(boot + 84));
+    (volume_start, fat_start, fat_sectors, fat_copies) = (start, start + offset + active * length, length, 1);
+    (cluster_sectors, cluster_bytes) = (1u32 << shift, SECTOR_SIZE << shift);
+    (data_start, cluster_count, root_cluster) = (start + GetWord(boot + 88), GetWord(boot + 92), GetWord(boot + 96));
+
+    if cluster_count == 0 || cluster_count + 2 > length * FAT_ENTRIES_PER_SECTOR || !IsValidCluster(root_cluster) {
+        return false;
+    }
+
+    (free_clusters, next_free, information_dirty) = (UNKNOWN_COUNT, 2, false);
+    (cached_bitmap_sector, bitmap_dirty) = (NO_SECTOR, false);
+    RootInfo(&mut bitmap_file);
+    bitmap_file.first_cluster = 0;
+    let (mut upcase_first, mut upcase_length) = (0u32, 0u32);
+    let mut cursor = MakeCursor(root_cluster, 0);
+
+    while cursor.cluster != 0 {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return false;
+        }
+
+        let kind = entry[0] as u32;
+
+        if kind == 0 {
+            break;
+        }
+
+        if kind == EXFAT_BITMAP && (entry[1] as u32 & 1) == active {
+            (bitmap_file.first_cluster, bitmap_file.size) = (GetWord(entry as *u8 + 20), GetWord(entry as *u8 + 24));
+        } else if kind == EXFAT_UPCASE {
+            (upcase_first, upcase_length) = (GetWord(entry as *u8 + 20), GetWord(entry as *u8 + 24));
+        }
+
+        Advance(&mut cursor);
+    }
+
+    if !IsValidCluster(bitmap_file.first_cluster) || bitmap_file.size < (cluster_count + 7) / 8 {
+        return false;
+    }
+
+    (bitmap_file.data_length, bitmap_file.cursor_cluster, bitmap_file.attributes) = (bitmap_file.size, bitmap_file.first_cluster, 0);
+    (chain_end, fat_mask) = (EXFAT_END_OF_CHAIN, 0xFFFFFFFF);
+    InitializeExFATOperations();
+    operations = &exfat_operations;
+    LoadUpcase(upcase_first, upcase_length);
+    upcase_loaded = upcase_table != null;
+    !io_failed
+}
+
+fn SetChecksum(data: *u8, length: u32) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i: u32 = 0;
+
+    while i < length {
+        if i != 2 && i != 3 {
+            sum = ((if (sum & 1) != 0 { 0x8000 } else { 0 }) + (sum >> 1) + data[i as usize] as u32) & 0xFFFF;
+        }
+
+        i += 1;
+    }
+
+    sum
+}
+
+fn NameHash(units: *u16, count: u32) -> u32 {
+    let mut hash: u32 = 0;
+    let mut i: u32 = 0;
+
+    while i < count {
+        let upper = Upcase(units[i as usize] as u32);
+        hash = ((if (hash & 1) != 0 { 0x8000 } else { 0 }) + (hash >> 1) + (upper & 0xFF)) & 0xFFFF;
+        hash = ((if (hash & 1) != 0 { 0x8000 } else { 0 }) + (hash >> 1) + (upper >> 8)) & 0xFFFF;
+        i += 1;
+    }
+
+    hash
+}
+
+fn ExFATNextFile(cursor: *mut Cursor, info: *mut FileInfo) -> u32 {
+    loop {
+        if cursor->cluster == 0 {
+            return if io_failed { FILE_IO_ERROR } else { FILE_NOT_FOUND };
+        }
+
+        let entry = EntryPointer(cursor as *Cursor);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        let kind = entry[0] as u32;
+
+        if kind == 0 {
+            return FILE_NOT_FOUND;
+        }
+
+        let secondary = entry[1] as u32;
+
+        if kind != EXFAT_FILE || secondary < 2 || secondary + 1 > EXFAT_MAX_SET {
+            Advance(cursor);
+            continue;
+        }
+
+        let (start_cluster, start_index, contiguous) = (cursor->cluster, cursor->index, cursor->contiguous);
+        let mut complete = true;
+        let mut k: u32 = 0;
+
+        while k <= secondary {
+            if cursor->cluster == 0 {
+                complete = false;
+                break;
+            }
+
+            let part = EntryPointer(cursor as *Cursor);
+
+            if part == null {
+                return FILE_IO_ERROR;
+            }
+
+            let wanted = if k == 1 { EXFAT_STREAM } else { EXFAT_NAME };
+
+            if k > 0 && part[0] as u32 != wanted {
+                complete = false;
+                break;
+            }
+
+            let mut j: u32 = 0;
+
+            while j < ENTRY_SIZE {
+                set_buffer[(k * ENTRY_SIZE + j) as usize] = part[j as usize];
+                j += 1;
+            }
+
+            Advance(cursor);
+            k += 1;
+        }
+
+        let length = (secondary + 1) * ENTRY_SIZE;
+
+        if !complete || SetChecksum(&set_buffer[0] as *u8, length) != GetHalf(&set_buffer[2] as *u8) {
+            continue;
+        }
+
+        let stream = &set_buffer[32] as *u8;
+        let units = stream[3] as u32;
+
+        if units == 0 || (units + EXFAT_NAME_CHARACTERS - 1) / EXFAT_NAME_CHARACTERS > secondary - 1 {
+            continue;
+        }
+
+        let mut j: u32 = 0;
+
+        while j < units {
+            long_units[j as usize] = GetHalf(&set_buffer[(64 + (j / EXFAT_NAME_CHARACTERS) * ENTRY_SIZE + 2 + (j % EXFAT_NAME_CHARACTERS) * 2) as usize] as *u8) as u16;
+            j += 1;
+        }
+
+        if !LongNameToText(units, &mut info->name[0]) {
+            continue;
+        }
+
+        short_display[0] = '\0';
+        let attributes = GetHalf(&set_buffer[4] as *u8);
+        let data_length = if GetWord(stream + 28) != 0 { 0xFFFFFFFF } else { GetWord(stream + 24) };
+        info->attributes = attributes;
+        info->size = if (attributes & ATTRIBUTE_FOLDER) != 0 { 0 } else { data_length };
+        info->first_cluster = GetWord(stream + 20);
+        info->flags = if (stream[1] & 2) != 0 { FILE_CONTIGUOUS } else { 0 };
+        info->data_length = data_length;
+        (info->entry_cluster, info->entry_index, info->start_cluster, info->start_index) = (start_cluster, start_index, start_cluster, start_index);
+        (info->entry_count, info->parent_contiguous) = (secondary + 1, if contiguous { 1 } else { 0 });
+        (info->cursor_index, info->cursor_cluster) = (0, info->first_cluster);
+        return FILE_OK;
+    }
+
+    FILE_NOT_FOUND
+}
+
+fn ReadSet(info: *FileInfo) -> bool {
+    let mut cursor = EntryCursor(info, info->start_cluster, info->start_index);
+    let mut k: u32 = 0;
+
+    while k < info->entry_count {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return false;
+        }
+
+        let mut j: u32 = 0;
+
+        while j < ENTRY_SIZE {
+            set_buffer[(k * ENTRY_SIZE + j) as usize] = entry[j as usize];
+            j += 1;
+        }
+
+        Advance(&mut cursor);
+        k += 1;
+    }
+
+    true
+}
+
+fn WriteSet(start: *Cursor, count: u32) -> bool {
+    let mut cursor = Cursor { cluster: start->cluster, index: start->index, contiguous: start->contiguous, remaining: 0xFFFFFFFF };
+    PutHalf(&mut set_buffer[2], SetChecksum(&set_buffer[0] as *u8, count * ENTRY_SIZE));
+    let mut k: u32 = 0;
+
+    while k < count {
+        let entry = EntryPointer(&cursor);
+
+        if entry == null {
+            return false;
+        }
+
+        let mut j: u32 = 0;
+
+        while j < ENTRY_SIZE {
+            entry[j as usize] = set_buffer[(k * ENTRY_SIZE + j) as usize];
+            j += 1;
+        }
+
+        sector_dirty = true;
+
+        if k + 1 < count && !Advance(&mut cursor) {
+            return false;
+        }
+
+        k += 1;
+    }
+
+    true
+}
+
+fn UpdateSetLength(folder: *mut FileInfo) -> u32 {
+    if !ReadSet(folder as *FileInfo) {
+        return FILE_IO_ERROR;
+    }
+
+    let stream = &mut set_buffer[32] as *mut u8;
+    stream[1] = (if (folder->flags & FILE_CONTIGUOUS) != 0 { 3 } else { 1 }) as u8;
+    PutWord(stream + 8, folder->data_length);
+    PutWord(stream + 12, 0);
+    PutWord(stream + 24, folder->data_length);
+    PutWord(stream + 28, 0);
+    let start = EntryCursor(folder as *FileInfo, folder->start_cluster, folder->start_index);
+    if WriteSet(&start, folder->entry_count) { FILE_OK } else { FILE_IO_ERROR }
+}
+
+fn ExFATGrowFolder(folder: *mut FileInfo, last: u32) -> u32 {
+    if (folder->flags & FILE_CONTIGUOUS) != 0 {
+        let count = folder->data_length / cluster_bytes;
+        let mut k: u32 = 0;
+
+        while k < count {
+            let cluster = folder->first_cluster + k;
+
+            if !WriteFat(cluster, if k + 1 == count { ChainEnd() } else { cluster + 1 }) {
+                return 0;
+            }
+
+            k += 1;
+        }
+
+        folder->flags = folder->flags & !FILE_CONTIGUOUS;
+    }
+
+    let cluster = AllocateCluster(last, true);
+
+    if cluster == 0 {
+        return 0;
+    }
+
+    if folder->entry_count != 0 {
+        folder->data_length += cluster_bytes;
+
+        if UpdateSetLength(folder) != FILE_OK {
+            return 0;
+        }
+    }
+
+    cluster
+}
+
+fn ExFATCreateEntry(folder: *mut FileInfo, name: *i8, attributes: u32, cluster: u32, size: u32, flags: u32, length: u32, info: *mut FileInfo) -> u32 {
+    if !IsValidName(name) {
+        return FILE_BAD_NAME;
+    }
+
+    let names = (TextToLongName(name) + EXFAT_NAME_CHARACTERS - 1) / EXFAT_NAME_CHARACTERS;
+    let count = 2 + names;
+    let mut cursor = MakeCursor(0, 0);
+
+    if !FindFreeEntries(folder, count, &mut cursor) {
+        return if io_failed { FILE_IO_ERROR } else { FILE_NO_SPACE };
+    }
+
+    let units = TextToLongName(name);
+    let mut i: u32 = 0;
+
+    while i < count * ENTRY_SIZE {
+        set_buffer[i as usize] = 0;
+        i += 1;
+    }
+
+    let stamp = FatTimestamp();
+    let contiguous = cluster != 0 && (flags & FILE_CONTIGUOUS) != 0;
+    set_buffer[0] = EXFAT_FILE as u8;
+    set_buffer[1] = (count - 1) as u8;
+    PutHalf(&mut set_buffer[4], attributes);
+    PutWord(&mut set_buffer[8], stamp);
+    PutWord(&mut set_buffer[12], stamp);
+    PutWord(&mut set_buffer[16], stamp);
+    set_buffer[32] = EXFAT_STREAM as u8;
+    set_buffer[33] = (if cluster == 0 { 0 } else if contiguous { 3 } else { 1 }) as u8;
+    set_buffer[35] = units as u8;
+    PutHalf(&mut set_buffer[36], NameHash(&long_units[0] as *u16, units));
+    PutWord(&mut set_buffer[40], length);
+    PutWord(&mut set_buffer[52], cluster);
+    PutWord(&mut set_buffer[56], length);
+    i = 0;
+
+    while i < units {
+        let at = 64 + (i / EXFAT_NAME_CHARACTERS) * ENTRY_SIZE;
+        set_buffer[at as usize] = EXFAT_NAME as u8;
+        PutHalf(&mut set_buffer[(at + 2 + (i % EXFAT_NAME_CHARACTERS) * 2) as usize], long_units[i as usize] as u32);
+        i += 1;
+    }
+
+    i = 1;
+
+    while i < names {
+        set_buffer[(64 + i * ENTRY_SIZE) as usize] = EXFAT_NAME as u8;
+        i += 1;
+    }
+
+    if !WriteSet(&cursor, count) {
+        return FILE_IO_ERROR;
+    }
+
+    CopyText(&mut info->name[0], name, FILE_NAME_LENGTH);
+    (info->size, info->first_cluster, info->attributes) = (size, cluster, attributes);
+    (info->entry_cluster, info->entry_index, info->start_cluster, info->start_index) = (cursor.cluster, cursor.index, cursor.cluster, cursor.index);
+    (info->flags, info->data_length, info->entry_count, info->parent_contiguous) = (if contiguous { FILE_CONTIGUOUS } else { 0 }, length, count, if cursor.contiguous { 1 } else { 0 });
+    (info->cursor_index, info->cursor_cluster) = (0, cluster);
+    FILE_OK
+}
+
+fn ExFATDeleteEntry(info: *FileInfo) -> u32 {
+    let mut set = EntryCursor(info, info->start_cluster, info->start_index);
+    let mut k: u32 = 0;
+
+    while k < info->entry_count {
+        let entry = EntryPointer(&set);
+
+        if entry == null {
+            return FILE_IO_ERROR;
+        }
+
+        entry[0] = entry[0] & 0x7F;
+        sector_dirty = true;
+
+        if k + 1 < info->entry_count && !Advance(&mut set) {
+            return FILE_IO_ERROR;
+        }
+
+        k += 1;
+    }
+
+    FILE_OK
+}
+
+fn ExFATUpdateEntry(info: *FileInfo, cluster: u32, size: u32) -> u32 {
+    if !ReadSet(info) {
+        return FILE_IO_ERROR;
+    }
+
+    let stamp = FatTimestamp();
+    PutHalf(&mut set_buffer[4], GetHalf(&set_buffer[4] as *u8) | ATTRIBUTE_ARCHIVE);
+    PutWord(&mut set_buffer[12], stamp);
+    PutWord(&mut set_buffer[16], stamp);
+    set_buffer[33] = (if cluster == 0 { 0 } else { 1 }) as u8;
+    PutWord(&mut set_buffer[40], size);
+    PutWord(&mut set_buffer[44], 0);
+    PutWord(&mut set_buffer[52], cluster);
+    PutWord(&mut set_buffer[56], size);
+    PutWord(&mut set_buffer[60], 0);
+    let start = EntryCursor(info, info->start_cluster, info->start_index);
+    if WriteSet(&start, info->entry_count) { FILE_OK } else { FILE_IO_ERROR }
+}
+
+static mut exfat_operations: VolumeOperations;
+
+fn ExFATIsFreeEntry(entry: *u8) -> bool {
+    entry[0] < 0x80
+}
+
+fn ExFATPrepareFolder(cluster: u32, parent_folder: *FileInfo) -> bool {
+    true
+}
+
+fn ExFATSetParent(folder: *FileInfo, parent_cluster: u32) -> u32 {
+    FILE_OK
+}
+
+fn InitializeExFATOperations() {
+    exfat_operations.name = "exFAT";
+    exfat_operations.next_file = ExFATNextFile;
+    exfat_operations.create_entry = ExFATCreateEntry;
+    exfat_operations.delete_entry = ExFATDeleteEntry;
+    exfat_operations.update_entry = ExFATUpdateEntry;
+    exfat_operations.is_free_entry = ExFATIsFreeEntry;
+    exfat_operations.grow_folder = ExFATGrowFolder;
+    exfat_operations.is_cluster_free = ExFATIsClusterFree;
+    exfat_operations.set_cluster_used = ExFATSetClusterUsed;
+    exfat_operations.prepare_folder = ExFATPrepareFolder;
+    exfat_operations.set_parent = ExFATSetParent;
+    exfat_operations.flush = FlushBitmap;
+}

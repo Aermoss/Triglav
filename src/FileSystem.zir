@@ -14,230 +14,92 @@
  * limitations under the License.
  */
 
-#[include "src/Memory.zir", "src/Strings.zir", "src/Trap.zir", "src/Process.zir", "src/Flash.zir" : *]
+#[include "src/Volume.zir", "src/FAT32.zir", "src/ExFAT.zir" : *]
 
-const FILE_SYSTEM_OFFSET: u32 = 0x200000;
-const FILE_SYSTEM_START: u32 = FLASH_START + FILE_SYSTEM_OFFSET;
-const FILE_SYSTEM_MAGIC: u32 = 0x53464754;
-const FILE_SYSTEM_VERSION: u32 = 4;
-const BLOCK_SIZE: u32 = 4096;
-const TABLE_BLOCKS: u32 = 8;
-const TABLE_PAGE: u32 = 256;
-const MAX_BLOCKS: u32 = (FLASH_WRITABLE_END - FILE_SYSTEM_OFFSET) / BLOCK_SIZE;
-const DEFAULT_BLOCKS: u32 = 512;
-
-const TABLE_HEADER_SIZE: u32 = 32;
-const FILE_ENTRY_SIZE: u32 = 64;
-const FILE_NAME_LENGTH: u32 = 32;
-const MAX_FILES: u32 = 63;
-const TABLE_SIZE: u32 = TABLE_HEADER_SIZE + MAX_FILES * FILE_ENTRY_SIZE;
-const CHECKSUM_SEED: u32 = 0x5A5A5A5A;
-
-const ROOT_DIRECTORY: u32 = 0;
-const FILE_DIRECTORY: u32 = 1;
-
-const ROOT_ENTRY: u32 = 0xFFFFFFFE;
-const NO_ENTRY: u32 = 0xFFFFFFFF;
-
-const FILE_OK: u32 = 0;
-const FILE_NO_FILE_SYSTEM: u32 = 1;
-const FILE_NOT_FOUND: u32 = 2;
-const FILE_BAD_NAME: u32 = 3;
-const FILE_TABLE_FULL: u32 = 4;
-const FILE_NO_SPACE: u32 = 5;
-const FILE_WRITE_FAILED: u32 = 6;
-const FILE_NOT_DIRECTORY: u32 = 7;
-const FILE_IS_DIRECTORY: u32 = 8;
-const FILE_NOT_EMPTY: u32 = 9;
-const FILE_EXISTS: u32 = 10;
-const FILE_INTO_ITSELF: u32 = 11;
-const FILE_NO_MEMORY: u32 = 12;
-const FILE_BAD_HANDLE: u32 = 13;
-const FILE_BUSY: u32 = 14;
-const FILE_NOT_ALLOWED: u32 = 15;
-const FILE_TOO_MANY: u32 = 16;
-const FILE_BAD_POSITION: u32 = 17;
-const FILE_NOT_EXECUTABLE: u32 = 18;
-const FILE_NO_PROCESS: u32 = 19;
-const FILE_CRASHED: u32 = 20;
-const FILE_KILLED: u32 = 21;
-const FILE_TOO_LONG: u32 = 22;
-
+const MAX_LIST_ENTRIES: u32 = 65536;
 const KIND_FILE: u32 = 1;
-const KIND_DIRECTORY: u32 = 2;
-const LIST_ENTRY_SIZE: u32 = 40;
+const KIND_FOLDER: u32 = 2;
+const LIST_ENTRY_SIZE: u32 = FILE_NAME_LENGTH + 8;
 
-struct TableHeader {
-    pub magic: u32,
-    pub version: u32,
-    pub sequence: u32,
-    pub count: u32,
-    pub block_count: u32,
-    pub checksum: u32,
-    pub next_id: u32,
-    pub next_block: u32
-}
-
-struct FileEntry {
-    pub name: [i8; 32],
-    pub first_block: u32,
-    pub size: u32,
-    pub id: u32,
-    pub parent: u32,
-    pub flags: u32,
-    pub reserved0: u32,
-    pub reserved1: u32,
-    pub reserved2: u32
-}
-
-static mut file_table: *mut u8 = null;
-static mut current_table: u32 = 0;
-static mut current_offset: u32 = 0;
-static mut table_end: u32 = 0;
 static mut file_system_ready: bool = false;
 static mut file_system_locked: bool = false;
-static mut used_blocks: [u8; 192];
+static mut current_path: [i8; 256];
+static mut scratch_path: [i8; 256];
+static mut walk_component: [i8; 256];
+static mut scratch_name: [i8; 256];
+static mut scratch_canonical: [i8; 256];
+static mut scratch_parent: FileInfo;
+static mut scratch_info: FileInfo;
+static mut scratch_other: FileInfo;
 
-static mut current_directory: u32 = 0;
-
-fn Table() -> *mut TableHeader {
-    file_table as *mut TableHeader
+fn FileSystemName() -> *i8 {
+    if operations == null { "none" } else { operations->name }
 }
 
-fn GetFile(index: u32) -> *mut FileEntry {
-    (file_table + (TABLE_HEADER_SIZE + index * FILE_ENTRY_SIZE) as usize) as *mut FileEntry
-}
+fn MountFileSystem() -> bool {
+    file_system_ready = false;
+    (cached_sector, sector_dirty, cached_fat_sector, fat_dirty, io_failed) = (NO_SECTOR, false, NO_SECTOR, false, false);
 
-fn FileName(file: *FileEntry) -> *i8 {
-    &file->name[0] as *i8
-}
-
-fn IsDirectory(file: *FileEntry) -> bool {
-    (file->flags & FILE_DIRECTORY) != 0
-}
-
-fn BlockCount(size: u32) -> u32 {
-    (size + BLOCK_SIZE - 1) / BLOCK_SIZE
-}
-
-fn BlockOffset(block: u32) -> u32 {
-    FILE_SYSTEM_OFFSET + block * BLOCK_SIZE
-}
-
-fn StringLength(mut text: *i8) -> u32 {
-    let mut length: u32 = 0;
-
-    while *text != '\0' {
-        text += 1;
-        length += 1;
-    }
-
-    length
-}
-
-fn TableChecksum(table: *u8, count: u32) -> u32 {
-    let words = table as *u32;
-    let length = (TABLE_HEADER_SIZE + count * FILE_ENTRY_SIZE) / 4;
-    let mut sum = CHECKSUM_SEED;
-    let mut i: u32 = 0;
-
-    while i < length {
-        let word = if i == 5 { 0 } else { words[i as usize] };
-        sum = ((sum << 5) | (sum >> 27)) ^ word;
-        i += 1;
-    }
-
-    sum
-}
-
-fn CopyFromFlash(offset: u32, destination: *mut u8, count: u32) {
-    let source = (FLASH_START + offset) as *u32;
-    let words = destination as *mut u32;
-    let mut i: u32 = 0;
-
-    while i < count / 4 {
-        words[i as usize] = source[i as usize];
-        i += 1;
-    }
-}
-
-fn IsValidTable(table: *u8) -> bool {
-    let header = table as *TableHeader;
-
-    header->magic == FILE_SYSTEM_MAGIC && header->version == FILE_SYSTEM_VERSION && header->count <= MAX_FILES &&
-        header->block_count > TABLE_BLOCKS && header->block_count <= MAX_BLOCKS && header->checksum == TableChecksum(table, header->count)
-}
-
-fn TableLength(count: u32) -> u32 {
-    TABLE_HEADER_SIZE + count * FILE_ENTRY_SIZE
-}
-
-fn TableSpace(count: u32) -> u32 {
-    (TableLength(count) + TABLE_PAGE - 1) / TABLE_PAGE * TABLE_PAGE
-}
-
-fn ReadTableAt(offset: u32) -> bool {
-    let header = (FLASH_START + offset) as *TableHeader;
-
-    if header->magic != FILE_SYSTEM_MAGIC || header->version != FILE_SYSTEM_VERSION || header->count > MAX_FILES {
+    if !SDInitialize() {
         return false;
     }
 
-    CopyFromFlash(offset, file_table, TableLength(header->count));
-    IsValidTable(file_table as *u8)
-}
+    let mut start: u32 = 0;
+    let mut sector = LoadSector(0);
 
-fn IsErased(offset: u32, length: u32) -> bool {
-    let words = (FLASH_START + offset) as *u32;
-    let mut i: u32 = 0;
+    if sector == null {
+        return false;
+    }
 
-    while i < length / 4 {
-        if words[i as usize] != 0xFFFFFFFF {
+    if !IsBootSector(sector as *u8) && !IsExFATBootSector(sector as *u8) {
+        if sector[510] != 0x55 || sector[511] != 0xAA {
             return false;
         }
 
-        i += 1;
+        let mut found = false;
+        let mut i: u32 = 0;
+
+        while i < 4 && !found {
+            let entry = sector + (446 + i * 16) as usize;
+            let kind = entry[4];
+
+            if kind == 0x0B || kind == 0x0C || kind == 0x1B || kind == 0x1C || kind == 0x07 {
+                start = GetWord(entry as *u8 + 8);
+                found = start != 0;
+            }
+
+            i += 1;
+        }
+
+        if !found {
+            return false;
+        }
+
+        sector = LoadSector(start);
+
+        if sector == null || (!IsBootSector(sector as *u8) && !IsExFATBootSector(sector as *u8)) {
+            return false;
+        }
     }
 
+    operations = null;
+    let mounted = if IsExFATBootSector(sector as *u8) { ExFATMount(start, sector as *u8) } else { FAT32Mount(start, sector as *u8) };
+
+    if !mounted || io_failed {
+        operations = null;
+        return false;
+    }
+
+    current_path[0] = '/';
+    current_path[1] = '\0';
+    file_system_ready = true;
     true
 }
 
 fn InitializeFileSystem() {
-    file_table = Allocate(TABLE_SIZE);
-    file_system_ready = false;
-    current_directory = ROOT_DIRECTORY;
-
-    let mut block: u32 = 0;
-    let mut best_sequence: u32 = 0;
-
-    while block < TABLE_BLOCKS {
-        let mut offset: u32 = 0;
-
-        while offset < BLOCK_SIZE && ReadTableAt(BlockOffset(block) + offset) {
-            let (sequence, space) = (Table()->sequence, TableSpace(Table()->count));
-
-            if !file_system_ready || ((sequence - best_sequence) as i32) > 0 {
-                (best_sequence, current_table, current_offset, table_end) = (sequence, block, offset, offset + space);
-                file_system_ready = true;
-            }
-
-            offset += space;
-        }
-
-        block += 1;
-    }
-
-    if file_system_ready {
-        ReadTableAt(BlockOffset(current_table) + current_offset);
-
-        if !IsErased(BlockOffset(current_table) + table_end, BLOCK_SIZE - table_end) {
-            table_end = BLOCK_SIZE;
-        }
-    }
-}
-
-fn HasFileSystem() -> bool {
-    file_system_ready
+    current_path[0] = '/';
+    current_path[1] = '\0';
+    MountFileSystem();
 }
 
 fn LockFileSystem() {
@@ -259,734 +121,695 @@ fn UnlockFileSystem() {
     file_system_locked = false;
 }
 
-fn FileCount() -> u32 {
-    if file_system_ready { Table()->count } else { 0 }
-}
-
-fn FileSystemBlocks() -> u32 {
-    if file_system_ready { Table()->block_count } else { 0 }
-}
-
-fn UsedBlockCount() -> u32 {
-    let count = FileCount();
-    let mut used = TABLE_BLOCKS;
-    let mut i: u32 = 0;
-
-    while i < count {
-        used += BlockCount(GetFile(i)->size);
-        i += 1;
-    }
-
-    used
-}
-
-fn IndexOfId(id: u32) -> u32 {
-    if id == ROOT_DIRECTORY {
-        return ROOT_ENTRY;
-    }
-
-    let count = FileCount();
-    let mut i: u32 = 0;
-
-    while i < count {
-        if GetFile(i)->id == id {
-            return i;
-        }
-
-        i += 1;
-    }
-
-    NO_ENTRY
-}
-
-fn IdOfIndex(index: u32) -> u32 {
-    if index == ROOT_ENTRY { ROOT_DIRECTORY } else { GetFile(index)->id }
-}
-
-fn IsDirectoryIndex(index: u32) -> bool {
-    index == ROOT_ENTRY || (index != NO_ENTRY && IsDirectory(GetFile(index) as *FileEntry))
-}
-
-fn ParentOf(index: u32) -> u32 {
-    if index == ROOT_ENTRY { ROOT_DIRECTORY } else { GetFile(index)->parent }
-}
-
-fn FindChild(directory: u32, name: *i8) -> u32 {
-    let count = FileCount();
-    let mut i: u32 = 0;
-
-    while i < count {
-        let file = GetFile(i);
-
-        if file->parent == directory && Equals(FileName(file as *FileEntry), name) {
-            return i;
-        }
-
-        i += 1;
-    }
-
-    NO_ENTRY
-}
-
-fn HasChildren(directory: u32) -> bool {
-    let count = FileCount();
-    let mut i: u32 = 0;
-
-    while i < count {
-        if GetFile(i)->parent == directory {
-            return true;
-        }
-
-        i += 1;
-    }
-
-    false
-}
-
-fn ResolvePath(path: *i8, length: u32) -> u32 {
-    let mut index = if length > 0 && *path == '/' { ROOT_ENTRY } else { IndexOfId(current_directory) };
-    let mut component: [i8; 32];
-    let mut i: u32 = 0;
-
-    while i < length {
-        if *(path + i as usize) == '/' {
-            i += 1;
-            continue;
-        }
-
-        let mut n: u32 = 0;
-
-        while i < length && *(path + i as usize) != '/' {
-            if n + 1 >= FILE_NAME_LENGTH {
-                return NO_ENTRY;
-            }
-
-            component[n as usize] = *(path + i as usize);
-            n += 1;
-            i += 1;
-        }
-
-        component[n as usize] = '\0';
-
-        if !IsDirectoryIndex(index) {
-            return NO_ENTRY;
-        }
-
-        if Equals(&component[0] as *i8, "..") {
-            index = IndexOfId(ParentOf(index));
-        } else if !Equals(&component[0] as *i8, ".") {
-            index = FindChild(IdOfIndex(index), &component[0] as *i8);
-
-            if index == NO_ENTRY {
-                return NO_ENTRY;
-            }
-        }
-    }
-
-    index
-}
-
-fn FindPath(path: *i8) -> u32 {
-    ResolvePath(path, StringLength(path))
-}
-
-fn FindFile(path: *i8) -> *FileEntry {
-    if !file_system_ready {
-        return null;
-    }
-
-    let index = FindPath(path);
-    if index == NO_ENTRY || index == ROOT_ENTRY { null } else { GetFile(index) as *FileEntry }
-}
-
-fn IsValidName(mut name: *i8) -> bool {
-    let mut length: u32 = 0;
-
-    while *name != '\0' {
-        if *name == ' ' || *name == '/' {
-            return false;
-        }
-
-        name += 1;
-        length += 1;
-    }
-
-    length > 0 && length < FILE_NAME_LENGTH
-}
-
-fn SplitPath(path: *i8, name: *mut i8) -> u32 {
-    let mut length = StringLength(path);
-
-    while length > 1 && *(path + (length - 1) as usize) == '/' {
-        length -= 1;
-    }
-
-    let mut start = length;
-
-    while start > 0 && *(path + (start - 1) as usize) != '/' {
-        start -= 1;
-    }
-
-    if length - start == 0 || length - start >= FILE_NAME_LENGTH {
-        *name = '\0';
-        return NO_ENTRY;
-    }
-
-    let mut i: u32 = 0;
-
-    while start + i < length {
-        name[i as usize] = *(path + (start + i) as usize);
-        i += 1;
-    }
-
-    name[i as usize] = '\0';
-    let directory = ResolvePath(path, start);
-    if IsDirectoryIndex(directory) { directory } else { NO_ENTRY }
-}
-
-fn CopyName(destination: *mut i8, mut name: *i8) {
-    let mut i: u32 = 0;
-
-    while i < FILE_NAME_LENGTH {
-        destination[i as usize] = *name;
-
-        if *name != '\0' {
-            name += 1;
-        }
-
-        i += 1;
-    }
-}
-
-fn AddEntry(name: *i8, parent: u32, flags: u32) -> u32 {
-    let table = Table();
-    let index = table->count;
-    let file = GetFile(index);
-    CopyName(&mut file->name[0], name);
-    (file->first_block, file->size, file->id, file->parent, file->flags) = (0, 0, table->next_id, parent, flags);
-    (file->reserved0, file->reserved1, file->reserved2) = (0, 0, 0);
-    table->next_id += 1;
-    table->count += 1;
-    index
-}
-
-fn RemoveEntry(index: u32) {
-    let count = Table()->count;
-    let mut i = index;
-
-    while i + 1 < count {
-        let (destination, source) = (GetFile(i) as *mut u8, GetFile(i + 1) as *u8);
-        let mut j: u32 = 0;
-
-        while j < FILE_ENTRY_SIZE {
-            destination[j as usize] = source[j as usize];
-            j += 1;
-        }
-
-        i += 1;
-    }
-
-    Table()->count = count - 1;
-}
-
-fn ReadFileData(file: *FileEntry, offset: u32, buffer: *mut u8, count: u32) -> u32 {
-    if offset >= file->size {
-        return 0;
-    }
-
-    let length = if count < file->size - offset { count } else { file->size - offset };
-    let start = FILE_SYSTEM_START + file->first_block * BLOCK_SIZE + offset;
-    let mut i: u32 = 0;
-
-    if ((start | (buffer as u32)) & 3) == 0 {
-        let source = start as *u32;
-        let destination = buffer as *mut u32;
-        let words = length / 4;
-        let mut w: u32 = 0;
-
-        while w < words {
-            destination[w as usize] = source[w as usize];
-            w += 1;
-        }
-
-        i = words * 4;
-    }
-
-    let mut word: u32 = 0;
-
-    while i < length {
-        let address = start + i;
-
-        if i == 0 || (address & 3) == 0 {
-            word = *((address & 0xFFFFFFFC) as *u32);
-        }
-
-        buffer[i as usize] = ((word >> ((address & 3) * 8)) & 0xFF) as u8;
-        i += 1;
-    }
-
-    length
-}
-
-fn ReadFile(file: *FileEntry, offset: u32, buffer: *mut u8, count: u32) -> u32 {
+fn Begin() -> u32 {
     LockFileSystem();
-    let length = ReadFileData(file, offset, buffer, count);
-    UnlockFileSystem();
-    length
-}
+    io_failed = false;
 
-fn GetPathKind(path: *i8) -> u32 {
-    if !file_system_ready { return 0; }
-    LockFileSystem();
-    let index = FindPath(path);
-    let kind: u32 = if index == NO_ENTRY { 0 } else if IsDirectoryIndex(index) { KIND_DIRECTORY } else { KIND_FILE };
-    UnlockFileSystem();
-    kind
-}
-
-fn GetCanonicalPath(path: *i8, buffer: *mut i8, capacity: usize) -> u32 {
-    if !file_system_ready { return FILE_NO_FILE_SYSTEM; }
-    LockFileSystem();
-    let mut index = FindPath(path);
-
-    if index == NO_ENTRY {
+    if !file_system_ready && !MountFileSystem() {
         UnlockFileSystem();
-        return FILE_NOT_FOUND;
+        return FILE_NO_FILE_SYSTEM;
     }
 
-    let mut components: [u32; 63];
-    let mut count: usize = 0;
-    let mut length: usize = 1;
-
-    while index != ROOT_ENTRY {
-        if index == NO_ENTRY || count == MAX_FILES as usize {
-            UnlockFileSystem();
-            return FILE_BAD_NAME;
-        }
-
-        components[count] = index;
-        count += 1;
-        length += StringLength(FileName(GetFile(index) as *FileEntry)) as usize;
-        if count > 1 { length += 1; }
-        index = IndexOfId(ParentOf(index));
-    }
-
-    if length >= capacity {
-        UnlockFileSystem();
-        return FILE_BAD_NAME;
-    }
-
-    let mut position: usize = 0;
-    buffer[position] = '/';
-    position += 1;
-
-    while count > 0 {
-        count -= 1;
-        let name = FileName(GetFile(components[count]) as *FileEntry);
-        let mut i: usize = 0;
-
-        while name[i] != 0 {
-            buffer[position] = name[i];
-            position += 1;
-            i += 1;
-        }
-
-        if count > 0 {
-            buffer[position] = '/';
-            position += 1;
-        }
-    }
-
-    buffer[position] = 0;
-    UnlockFileSystem();
     FILE_OK
 }
 
-fn ReadWholeFile(path: *i8, buffer: *mut u8, capacity: usize, size: *mut usize) -> u32 {
-    if !file_system_ready { return FILE_NO_FILE_SYSTEM; }
-    LockFileSystem();
-    let index = FindPath(path);
+fn Finish(result: u32) -> u32 {
+    let flushed = FlushAll();
+    let mut code = result;
 
-    if index == NO_ENTRY {
-        UnlockFileSystem();
-        return FILE_NOT_FOUND;
-    }
-
-    if IsDirectoryIndex(index) {
-        UnlockFileSystem();
-        return FILE_IS_DIRECTORY;
-    }
-
-    let file = GetFile(index) as *FileEntry;
-    *size = file->size as usize;
-
-    if buffer != null && capacity < *size {
-        UnlockFileSystem();
-        return FILE_NO_SPACE;
-    }
-
-    if buffer != null {
-        ReadFileData(file, 0, buffer, file->size);
+    if io_failed || !flushed {
+        file_system_ready = false;
+        code = FILE_IO_ERROR;
     }
 
     UnlockFileSystem();
-    FILE_OK
+    code
 }
 
-fn RemoveFile(path: *i8) -> u32 {
-    if !file_system_ready { return FILE_NO_FILE_SYSTEM; }
-    LockFileSystem();
-    let index = FindPath(path);
-
-    if index == NO_ENTRY {
-        UnlockFileSystem();
-        return FILE_NOT_FOUND;
-    }
-
-    if IsDirectoryIndex(index) {
-        UnlockFileSystem();
-        return FILE_IS_DIRECTORY;
-    }
-
-    RemoveEntry(index);
-    let result = CommitOrRestore();
-    UnlockFileSystem();
-    result
-}
-
-fn MarkBlocks(first: u32, count: u32) {
-    let mut block = first;
-
-    while block < first + count {
-        used_blocks[(block / 8) as usize] |= (1 << (block % 8)) as u8;
-        block += 1;
-    }
-}
-
-fn IsBlockUsed(block: u32) -> bool {
-    (used_blocks[(block / 8) as usize] & (1 << (block % 8)) as u8) != 0
-}
-
-fn FindRun(from: u32, to: u32, count: u32) -> u32 {
-    let mut start = from;
-    let mut run: u32 = 0;
-    let mut block = from;
-
-    while block < to && run < count {
-        if IsBlockUsed(block) {
-            run = 0;
-            start = block + 1;
-        } else {
-            run += 1;
-        }
-
-        block += 1;
-    }
-
-    if run == count { start } else { 0 }
-}
-
-fn FindFreeBlocks(count: u32) -> u32 {
-    let total = FileSystemBlocks();
-    let mut i: u32 = 0;
-
-    while i < 192 {
-        used_blocks[i as usize] = 0;
-        i += 1;
-    }
-
-    MarkBlocks(0, TABLE_BLOCKS);
-    i = 0;
-
-    while i < FileCount() {
-        let file = GetFile(i);
-        MarkBlocks(file->first_block, BlockCount(file->size));
-        i += 1;
-    }
-
-    let mut hint = Table()->next_block;
-
-    if hint < TABLE_BLOCKS || hint >= total {
-        hint = TABLE_BLOCKS;
-    }
-
-    let first = FindRun(hint, total, count);
-    if first != 0 { first } else { FindRun(TABLE_BLOCKS, total, count) }
-}
-
-fn MatchesFlash(offset: u32, data: *u8, count: u32) -> bool {
-    let flash = (FLASH_START + offset) as *u8;
-    let mut i: u32 = 0;
-
-    while i < count {
-        if flash[i as usize] != data[i as usize] {
-            return false;
-        }
-
-        i += 1;
-    }
-
-    true
-}
-
-fn CommitTable() -> bool {
-    let table = Table();
-    table->sequence += 1;
-    table->checksum = TableChecksum(file_table as *u8, table->count);
-    let (length, space) = (TableLength(table->count), TableSpace(table->count));
-    let (mut block, mut offset) = (current_table, table_end);
-
-    if offset + space > BLOCK_SIZE {
-        (block, offset) = ((current_table + 1) % TABLE_BLOCKS, 0);
-
-        if !EraseFlashSector(BlockOffset(block)) {
-            return false;
-        }
-    }
-
-    let address = BlockOffset(block) + offset;
-
-    if !ProgramFlash(address, file_table as *u8, length) || !MatchesFlash(address, file_table as *u8, length) {
-        if block == current_table {
-            table_end = BLOCK_SIZE;
-        }
-
+fn HasFileSystem() -> bool {
+    if Begin() != FILE_OK {
         return false;
     }
 
-    (current_table, current_offset, table_end) = (block, offset, offset + space);
+    Finish(FILE_OK) == FILE_OK
+}
+
+fn FindChild(folder: *FileInfo, name: *i8, info: *mut FileInfo) -> u32 {
+    let mut cursor = FolderCursor(folder);
+
+    loop {
+        let result = NextFile(&mut cursor, info);
+
+        if result != FILE_OK {
+            return result;
+        }
+
+        if SameName(&info->name[0] as *i8, name) || SameName(&short_display[0] as *i8, name) {
+            return FILE_OK;
+        }
+    }
+
+    FILE_NOT_FOUND
+}
+
+fn AppendComponents(text: *i8, output: *mut i8, length: *mut u32) -> bool {
+    let mut i: u32 = 0;
+
+    loop {
+        while text[i as usize] == '/' {
+            i += 1;
+        }
+
+        if text[i as usize] == '\0' {
+            return true;
+        }
+
+        let start = i;
+
+        while text[i as usize] != '/' && text[i as usize] != '\0' {
+            i += 1;
+        }
+
+        let size = i - start;
+
+        if size == 1 && text[start as usize] == '.' {
+            continue;
+        }
+
+        if size == 2 && text[start as usize] == '.' && text[(start + 1) as usize] == '.' {
+            while *length > 0 && output[(*length - 1) as usize] != '/' {
+                *length -= 1;
+            }
+
+            if *length > 0 {
+                *length -= 1;
+            }
+
+            continue;
+        }
+
+        if *length + size + 2 > MAX_PATH {
+            return false;
+        }
+
+        output[*length as usize] = '/';
+        *length += 1;
+        let mut k: u32 = 0;
+
+        while k < size {
+            output[(*length + k) as usize] = text[(start + k) as usize];
+            k += 1;
+        }
+
+        *length += size;
+    }
+
     true
 }
 
-fn RestoreTable() {
-    ReadTableAt(BlockOffset(current_table) + current_offset);
-}
+fn NormalizePath(path: *i8, output: *mut i8) -> bool {
+    let mut length: u32 = 0;
 
-fn CommitOrRestore() -> u32 {
-    if CommitTable() {
-        return FILE_OK;
+    if path[0] != '/' && !AppendComponents(&current_path[0] as *i8, output, &mut length) {
+        return false;
     }
 
-    RestoreTable();
-    FILE_WRITE_FAILED
+    if !AppendComponents(path, output, &mut length) {
+        return false;
+    }
+
+    if length == 0 {
+        output[0] = '/';
+        length = 1;
+    }
+
+    output[length as usize] = '\0';
+    true
 }
 
-fn WriteFileIn(directory: u32, name: *i8, data: *u8, size: u32) -> u32 {
-    if !IsValidName(name) {
+fn AppendName(path: *mut i8, length: *mut u32, name: *i8) -> bool {
+    let size = StringLength(name);
+
+    if *length + size + 2 > MAX_PATH {
+        return false;
+    }
+
+    path[*length as usize] = '/';
+    *length += 1;
+    let mut i: u32 = 0;
+
+    while i < size {
+        path[(*length + i) as usize] = name[i as usize];
+        i += 1;
+    }
+
+    *length += size;
+    path[*length as usize] = '\0';
+    true
+}
+
+fn WalkPath(normalized: *i8, info: *mut FileInfo, canonical: *mut i8) -> u32 {
+    RootInfo(info);
+    let mut canonical_length: u32 = 0;
+    let mut i: u32 = 1;
+
+    while normalized[i as usize] != '\0' {
+        let start = i;
+
+        while normalized[i as usize] != '/' && normalized[i as usize] != '\0' {
+            walk_component[(i - start) as usize] = normalized[i as usize];
+            i += 1;
+        }
+
+        walk_component[(i - start) as usize] = '\0';
+
+        if normalized[i as usize] == '/' {
+            i += 1;
+        }
+
+        if !IsFolder(info as *FileInfo) {
+            return FILE_NOT_FOUND;
+        }
+
+        let result = FindChild(info as *FileInfo, &walk_component[0] as *i8, info);
+
+        if result != FILE_OK {
+            return result;
+        }
+
+        if canonical != null && !AppendName(canonical, &mut canonical_length, &info->name[0] as *i8) {
+            return FILE_BAD_NAME;
+        }
+    }
+
+    if canonical != null && canonical_length == 0 {
+        canonical[0] = '/';
+        canonical[1] = '\0';
+    }
+
+    FILE_OK
+}
+
+fn Lookup(path: *i8, info: *mut FileInfo, canonical: *mut i8) -> u32 {
+    if !NormalizePath(path, &mut scratch_path[0]) {
         return FILE_BAD_NAME;
     }
 
-    let parent = IdOfIndex(directory);
-    let mut index = FindChild(parent, name);
+    WalkPath(&scratch_path[0] as *i8, info, canonical)
+}
 
-    if index != NO_ENTRY && IsDirectory(GetFile(index) as *FileEntry) {
-        return FILE_IS_DIRECTORY;
+fn LookupParent(path: *i8, parent: *mut FileInfo, name: *mut i8, canonical: *mut i8) -> u32 {
+    if !NormalizePath(path, &mut scratch_path[0]) {
+        return FILE_BAD_NAME;
     }
 
-    if index == NO_ENTRY && FileCount() == MAX_FILES {
-        return FILE_TABLE_FULL;
+    let length = StringLength(&scratch_path[0] as *i8);
+
+    if length <= 1 {
+        return FILE_BAD_NAME;
     }
 
-    let blocks = BlockCount(size);
-    let first = if blocks == 0 { 0 } else { FindFreeBlocks(blocks) };
+    let mut split = length;
 
-    if blocks > 0 && first == 0 {
-        return FILE_NO_SPACE;
+    while split > 0 && scratch_path[(split - 1) as usize] != '/' {
+        split -= 1;
     }
 
-    let mut block: u32 = 0;
+    CopyText(name, &scratch_path[split as usize] as *i8, FILE_NAME_LENGTH);
 
-    while block < blocks {
-        if !EraseFlashSector(BlockOffset(first + block)) {
-            return FILE_WRITE_FAILED;
+    if split == 1 {
+        scratch_path[1] = '\0';
+    } else {
+        scratch_path[(split - 1) as usize] = '\0';
+    }
+
+    let result = WalkPath(&scratch_path[0] as *i8, parent, canonical);
+
+    if result != FILE_OK {
+        return result;
+    }
+
+    if !IsFolder(parent as *FileInfo) { FILE_NOT_FOUND } else { FILE_OK }
+}
+
+fn IsEmptyFolder(folder: *FileInfo) -> bool {
+    let mut cursor = FolderCursor(folder);
+    NextFile(&mut cursor, &mut scratch_other) == FILE_NOT_FOUND && !io_failed
+}
+
+fn IsPathInside(path: *i8, ancestor: *i8) -> bool {
+    let (mut i, mut j): (usize, usize) = (0, 0);
+
+    while ancestor[j] != '\0' {
+        if path[i] == '\0' || NextCode(path, &mut i) != NextCode(ancestor, &mut j) {
+            return false;
+        }
+    }
+
+    path[i] == '\0' || path[i] == '/' || (j == 1 && ancestor[0] == '/')
+}
+
+fn FindFile(path: *i8, info: *mut FileInfo) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
+    }
+
+    Finish(Lookup(path, info, null))
+}
+
+fn ReadFileRange(info: *mut FileInfo, offset: u32, buffer: *mut u8, count: u32) -> u32 {
+    if Begin() != FILE_OK {
+        return 0;
+    }
+
+    let length = ReadData(info, offset, buffer, count);
+    if Finish(FILE_OK) == FILE_OK { length } else { 0 }
+}
+
+fn GetPathKind(path: *i8) -> u32 {
+    if Begin() != FILE_OK {
+        return 0;
+    }
+
+    let found = Lookup(path, &mut scratch_info, null) == FILE_OK;
+    let kind = if !found { 0 } else if IsFolder(&scratch_info) { KIND_FOLDER } else { KIND_FILE };
+    if Finish(FILE_OK) == FILE_OK { kind } else { 0 }
+}
+
+fn GetCanonicalPath(path: *i8, buffer: *mut i8, capacity: usize) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
+    }
+
+    let mut result = Lookup(path, &mut scratch_info, &mut scratch_canonical[0]);
+
+    if result == FILE_OK && !CopyText(buffer, &scratch_canonical[0] as *i8, capacity as u32) {
+        result = FILE_BAD_NAME;
+    }
+
+    Finish(result)
+}
+
+fn ReadWholeFile(path: *i8, buffer: *mut u8, capacity: usize, size: *mut usize) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
+    }
+
+    let mut result = Lookup(path, &mut scratch_info, null);
+
+    if result == FILE_OK && IsFolder(&scratch_info) {
+        result = FILE_IS_FOLDER;
+    }
+
+    if result == FILE_OK {
+        *size = scratch_info.size as usize;
+
+        if buffer != null && capacity < *size {
+            result = FILE_NO_SPACE;
+        } else if buffer != null && ReadData(&mut scratch_info, 0, buffer, scratch_info.size) != scratch_info.size {
+            result = FILE_IO_ERROR;
+        }
+    }
+
+    Finish(result)
+}
+
+fn WriteInto(folder: *mut FileInfo, name: *i8, data: *u8, size: u32) -> u32 {
+    let mut exists = false;
+    let found = FindChild(folder, name, &mut scratch_other);
+
+    if found == FILE_OK {
+        if IsFolder(&scratch_other) {
+            return FILE_IS_FOLDER;
         }
 
-        block += 1;
+        exists = true;
+    } else if found != FILE_NOT_FOUND {
+        return found;
+    } else if !IsValidName(name) {
+        return FILE_BAD_NAME;
     }
 
-    if size > 0 && (!ProgramFlash(BlockOffset(first), data, size) || !MatchesFlash(BlockOffset(first), data, size)) {
-        return FILE_WRITE_FAILED;
+    let (old_cluster, old_flags, old_length) = if exists { (scratch_other.first_cluster, scratch_other.flags, scratch_other.data_length) } else { (0u32, 0u32, 0u32) };
+    let mut first: u32 = 0;
+    let result = WriteChain(data, size, &mut first);
+
+    if result != FILE_OK {
+        return result;
     }
 
-    if index == NO_ENTRY {
-        index = AddEntry(name, parent, 0);
+    if exists {
+        let update = UpdateEntry(&scratch_other, first, size);
+
+        if update != FILE_OK {
+            return update;
+        }
+
+        if !ReleaseClusters(old_cluster, old_flags, old_length) {
+            return FILE_IO_ERROR;
+        }
+
+        return FILE_OK;
     }
 
-    let file = GetFile(index);
-    (file->first_block, file->size) = (first, size);
+    let created = CreateEntry(folder, name, ATTRIBUTE_ARCHIVE, first, size, 0, size, &mut scratch_other);
 
-    if blocks > 0 {
-        Table()->next_block = first + blocks;
+    if created != FILE_OK && first != 0 {
+        FreeChain(first);
     }
 
-    CommitOrRestore()
+    created
 }
 
 fn WriteFile(path: *i8, data: *u8, size: u32) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    LockFileSystem();
-    let mut name: [i8; 32];
-    let directory = SplitPath(path, &mut name[0]);
-    let result = if directory == NO_ENTRY { FILE_NOT_FOUND } else { WriteFileIn(directory, &name[0] as *i8, data, size) };
-    UnlockFileSystem();
-    result
+    let mut result = LookupParent(path, &mut scratch_parent, &mut scratch_name[0], null);
+
+    if result == FILE_OK {
+        CopyText(&mut scratch_canonical[0], &scratch_name[0] as *i8, FILE_NAME_LENGTH);
+        result = WriteInto(&mut scratch_parent, &scratch_canonical[0] as *i8, data, size);
+    }
+
+    Finish(result)
 }
 
-fn MakeDirectory(path: *i8) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
+fn PrepareWrite(path: *i8, canonical: *mut i8, info: *mut FileInfo, exists: *mut bool) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    LockFileSystem();
-    let mut name: [i8; 32];
-    let directory = SplitPath(path, &mut name[0]);
-    let mut result = FILE_OK;
+    *exists = false;
+    let mut result = LookupParent(path, &mut scratch_parent, &mut scratch_name[0], canonical);
 
-    if directory == NO_ENTRY {
+    if result == FILE_OK {
+        let found = FindChild(&scratch_parent, &scratch_name[0] as *i8, info);
+
+        if found == FILE_OK {
+            if IsFolder(info as *FileInfo) {
+                result = FILE_IS_FOLDER;
+            } else {
+                *exists = true;
+            }
+        } else if found != FILE_NOT_FOUND {
+            result = found;
+        } else if !IsValidName(&scratch_name[0] as *i8) {
+            result = FILE_BAD_NAME;
+        } else {
+            CopyText(&mut info->name[0], &scratch_name[0] as *i8, FILE_NAME_LENGTH);
+        }
+
+        if result == FILE_OK {
+            let mut length = StringLength(canonical as *i8);
+
+            if length == 1 {
+                length = 0;
+            }
+
+            if !AppendName(canonical, &mut length, &info->name[0] as *i8) {
+                result = FILE_BAD_NAME;
+            }
+        }
+    }
+
+    Finish(result)
+}
+
+fn CreateFolder(path: *i8) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
+    }
+
+    let mut result = LookupParent(path, &mut scratch_parent, &mut scratch_name[0], null);
+
+    if result == FILE_OK {
+        let found = FindChild(&scratch_parent, &scratch_name[0] as *i8, &mut scratch_other);
+
+        if found == FILE_OK {
+            result = FILE_EXISTS;
+        } else if found != FILE_NOT_FOUND {
+            result = found;
+        } else if !IsValidName(&scratch_name[0] as *i8) {
+            result = FILE_BAD_NAME;
+        } else {
+            let cluster = AllocateCluster(0, true);
+
+            if cluster == 0 {
+                result = if io_failed { FILE_IO_ERROR } else { FILE_NO_SPACE };
+            } else {
+                if !operations->prepare_folder(cluster, &scratch_parent) {
+                    result = FILE_IO_ERROR;
+                }
+
+                CopyText(&mut scratch_canonical[0], &scratch_name[0] as *i8, FILE_NAME_LENGTH);
+
+                if result == FILE_OK {
+                    result = CreateEntry(&mut scratch_parent, &scratch_canonical[0] as *i8, ATTRIBUTE_FOLDER, cluster, 0, 0, cluster_bytes, &mut scratch_other);
+                }
+
+                if result != FILE_OK {
+                    FreeChain(cluster);
+                }
+            }
+        }
+    }
+
+    Finish(result)
+}
+
+fn RemoveFound(info: *FileInfo, canonical: *i8) -> u32 {
+    if IsFolder(info) && !IsEmptyFolder(info) {
+        return if io_failed { FILE_IO_ERROR } else { FILE_NOT_EMPTY };
+    }
+
+    let result = DeleteEntry(info);
+
+    if result != FILE_OK {
+        return result;
+    }
+
+    if !ReleaseClusters(info->first_cluster, info->flags, info->data_length) {
+        return FILE_IO_ERROR;
+    }
+
+    if IsFolder(info) && IsPathInside(&current_path[0] as *i8, canonical) {
+        let mut length = StringLength(canonical);
+
+        while length > 1 && canonical[(length - 1) as usize] != '/' {
+            length -= 1;
+        }
+
+        let keep = if length > 1 { length - 1 } else { 1 };
+        let mut i: u32 = 0;
+
+        while i < keep {
+            current_path[i as usize] = canonical[i as usize];
+            i += 1;
+        }
+
+        current_path[keep as usize] = '\0';
+    }
+
+    FILE_OK
+}
+
+fn RemoveWith(path: *i8, files: bool, folders: bool) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
+    }
+
+    let mut result = Lookup(path, &mut scratch_info, &mut scratch_canonical[0]);
+
+    if result == FILE_OK && scratch_info.entry_cluster == 0 {
         result = FILE_NOT_FOUND;
-    } else if !IsValidName(&name[0] as *i8) || IsReservedName(&name[0] as *i8) {
-        result = FILE_BAD_NAME;
-    } else if FindChild(IdOfIndex(directory), &name[0] as *i8) != NO_ENTRY {
-        result = FILE_EXISTS;
-    } else if FileCount() == MAX_FILES {
-        result = FILE_TABLE_FULL;
-    } else {
-        AddEntry(&name[0] as *i8, IdOfIndex(directory), FILE_DIRECTORY);
-        result = CommitOrRestore();
+    } else if result == FILE_OK && IsFolder(&scratch_info) && !folders {
+        result = FILE_IS_FOLDER;
+    } else if result == FILE_OK && !IsFolder(&scratch_info) && !files {
+        result = FILE_NOT_FOLDER;
+    } else if result == FILE_OK {
+        result = RemoveFound(&scratch_info, &scratch_canonical[0] as *i8);
     }
 
-    UnlockFileSystem();
-    result
+    Finish(result)
 }
 
-fn RemoveIndex(index: u32) -> u32 {
-    let (id, parent, directory) = (GetFile(index)->id, GetFile(index)->parent, IsDirectory(GetFile(index) as *FileEntry));
+fn RemoveFile(path: *i8) -> u32 {
+    RemoveWith(path, true, false)
+}
 
-    if directory && HasChildren(id) {
-        return FILE_NOT_EMPTY;
-    }
-
-    RemoveEntry(index);
-    let result = CommitOrRestore();
-
-    if result == FILE_OK && current_directory == id {
-        current_directory = parent;
-    }
-
-    result
+fn RemoveFolder(path: *i8) -> u32 {
+    RemoveWith(path, false, true)
 }
 
 fn RemovePath(path: *i8) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
-    LockFileSystem();
-    let index = FindPath(path);
-    let result = if index == NO_ENTRY || index == ROOT_ENTRY { FILE_NOT_FOUND } else { RemoveIndex(index) };
-    UnlockFileSystem();
-    result
+    RemoveWith(path, true, true)
 }
 
-fn RemoveDirectory(path: *i8) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
+fn ListFolder(path: *i8, buffer: *mut u8, capacity: u32, count: *mut u32) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    LockFileSystem();
-    let index = FindPath(path);
-    let mut result = FILE_OK;
+    let mut result = Lookup(path, &mut scratch_info, null);
 
-    if index == NO_ENTRY || index == ROOT_ENTRY {
-        result = FILE_NOT_FOUND;
-    } else if !IsDirectoryIndex(index) {
-        result = FILE_NOT_DIRECTORY;
-    } else {
-        result = RemoveIndex(index);
+    if result == FILE_OK && !IsFolder(&scratch_info) {
+        result = FILE_NOT_FOLDER;
     }
 
-    UnlockFileSystem();
-    result
-}
-
-fn ListDirectory(path: *i8, buffer: *mut u8, capacity: u32, count: *mut u32) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
-    LockFileSystem();
-    let index = FindPath(path);
-
-    if index == NO_ENTRY {
-        UnlockFileSystem();
-        return FILE_NOT_FOUND;
-    }
-
-    if !IsDirectoryIndex(index) {
-        UnlockFileSystem();
-        return FILE_NOT_DIRECTORY;
-    }
-
-    let directory = IdOfIndex(index);
-    let total = FileCount();
     let mut found: u32 = 0;
-    let mut i: u32 = 0;
 
-    while i < total {
-        let file = GetFile(i);
+    if result == FILE_OK {
+        let mut cursor = FolderCursor(&scratch_info);
 
-        if file->parent == directory {
+        loop {
+            let next = NextFile(&mut cursor, &mut scratch_other);
+
+            if next != FILE_OK {
+                if next != FILE_NOT_FOUND {
+                    result = next;
+                }
+
+                break;
+            }
+
             if buffer != null && found < capacity {
-                let entry = buffer + (found * LIST_ENTRY_SIZE) as usize;
-                CopyName(entry as *mut i8, FileName(file as *FileEntry));
-                let fields = (entry + FILE_NAME_LENGTH as usize) as *mut u32;
-                fields[0] = if IsDirectory(file as *FileEntry) { KIND_DIRECTORY } else { KIND_FILE };
-                fields[1] = file->size;
+                let record = buffer + (found * LIST_ENTRY_SIZE) as usize;
+                CopyText(record as *mut i8, &scratch_other.name[0] as *i8, FILE_NAME_LENGTH);
+                let fields = (record + FILE_NAME_LENGTH as usize) as *mut u32;
+                fields[0] = if IsFolder(&scratch_other) { KIND_FOLDER } else { KIND_FILE };
+                fields[1] = scratch_other.size;
             }
 
             found += 1;
         }
-
-        i += 1;
     }
 
     *count = found;
-    UnlockFileSystem();
-    if buffer != null && found > capacity { FILE_NO_SPACE } else { FILE_OK }
-}
 
-fn FindDestination(destination: *i8, source_name: *i8, name: *mut i8) -> u32 {
-    let index = FindPath(destination);
-
-    if IsDirectoryIndex(index) {
-        CopyName(name, source_name);
-        return index;
+    if result == FILE_OK && buffer != null && found > capacity {
+        result = FILE_NO_SPACE;
     }
 
-    SplitPath(destination, name)
+    Finish(result)
 }
 
-fn IsInside(directory: u32, ancestor: u32) -> bool {
-    let mut id = directory;
+fn MoveEntry(source: *i8, destination: *i8, into_folder: bool) -> u32 {
+    let start = Begin();
 
-    while id != ROOT_DIRECTORY {
-        let index = IndexOfId(id);
+    if start != FILE_OK {
+        return start;
+    }
 
-        if id == ancestor || index == NO_ENTRY {
-            return id == ancestor;
+    let mut result = Lookup(source, &mut scratch_info, &mut scratch_canonical[0]);
+
+    if result == FILE_OK && scratch_info.entry_cluster == 0 {
+        result = FILE_NOT_FOUND;
+    }
+
+    if result != FILE_OK {
+        return Finish(result);
+    }
+
+    let is_folder = IsFolder(&scratch_info);
+    let mut target: [i8; 256];
+    let mut name: [i8; 256];
+    let mut moved = false;
+
+    if into_folder && Lookup(destination, &mut scratch_parent, &mut target[0]) == FILE_OK && IsFolder(&scratch_parent) {
+        CopyText(&mut name[0], &scratch_info.name[0] as *i8, FILE_NAME_LENGTH);
+        moved = true;
+    }
+
+    if !moved {
+        result = LookupParent(destination, &mut scratch_parent, &mut name[0], &mut target[0]);
+    }
+
+    if result == FILE_OK && !IsValidName(&name[0] as *i8) {
+        result = FILE_BAD_NAME;
+    }
+
+    if result == FILE_OK && is_folder && IsPathInside(&target[0] as *i8, &scratch_canonical[0] as *i8) {
+        result = FILE_INTO_ITSELF;
+    }
+
+    if result == FILE_OK {
+        let found = FindChild(&scratch_parent, &name[0] as *i8, &mut scratch_other);
+        let same = found == FILE_OK && scratch_other.entry_cluster == scratch_info.entry_cluster && scratch_other.entry_index == scratch_info.entry_index;
+
+        if found == FILE_OK && !same {
+            if is_folder || IsFolder(&scratch_other) {
+                result = FILE_EXISTS;
+            } else {
+                result = DeleteEntry(&scratch_other);
+
+                if result == FILE_OK && !ReleaseClusters(scratch_other.first_cluster, scratch_other.flags, scratch_other.data_length) {
+                    result = FILE_IO_ERROR;
+                }
+            }
+        } else if found != FILE_OK && found != FILE_NOT_FOUND {
+            result = found;
         }
 
-        id = ParentOf(index);
+        if result == FILE_OK {
+            let parent_cluster = FolderCluster(&scratch_parent);
+            result = CreateEntry(&mut scratch_parent, &name[0] as *i8, scratch_info.attributes, scratch_info.first_cluster, scratch_info.size, scratch_info.flags, scratch_info.data_length, &mut scratch_other);
+
+            if result == FILE_OK {
+                result = DeleteEntry(&scratch_info);
+            }
+
+            if result == FILE_OK && is_folder {
+                result = SetParentEntry(&scratch_info, parent_cluster);
+            }
+
+            if result == FILE_OK && is_folder && IsPathInside(&current_path[0] as *i8, &scratch_canonical[0] as *i8) {
+                let mut length = StringLength(&target[0] as *i8);
+
+                if length == 1 {
+                    length = 0;
+                }
+
+                AppendName(&mut target[0], &mut length, &name[0] as *i8);
+                let rest = &current_path[StringLength(&scratch_canonical[0] as *i8) as usize] as *i8;
+                let mut combined: [i8; 256];
+                let mut combined_length: u32 = 0;
+
+                if CopyText(&mut combined[0], &target[0] as *i8, MAX_PATH) {
+                    combined_length = StringLength(&combined[0] as *i8);
+                }
+
+                let mut i: u32 = 0;
+
+                while rest[i as usize] != '\0' && combined_length + i + 1 < MAX_PATH {
+                    combined[(combined_length + i) as usize] = rest[i as usize];
+                    i += 1;
+                }
+
+                combined[(combined_length + i) as usize] = '\0';
+                CopyText(&mut current_path[0], &combined[0] as *i8, MAX_PATH);
+            }
+        }
     }
 
-    ancestor == ROOT_DIRECTORY
-}
-
-fn IsReservedName(name: *i8) -> bool {
-    Equals(name, ".") || Equals(name, "..")
+    Finish(result)
 }
 
 fn MovePath(source: *i8, destination: *i8) -> u32 {
@@ -997,163 +820,118 @@ fn RenamePath(source: *i8, destination: *i8) -> u32 {
     MoveEntry(source, destination, false)
 }
 
-fn MoveEntry(source: *i8, destination: *i8, into_directory: bool) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
-    LockFileSystem();
-    let index = FindPath(source);
-    let mut name: [i8; 32];
-    let mut result = FILE_OK;
-
-    if index == NO_ENTRY || index == ROOT_ENTRY {
-        UnlockFileSystem();
-        return FILE_NOT_FOUND;
-    }
-
-    let id = GetFile(index)->id;
-    let is_directory = IsDirectory(GetFile(index) as *FileEntry);
-    let directory = if into_directory {
-        FindDestination(destination, FileName(GetFile(index) as *FileEntry), &mut name[0])
-    } else {
-        SplitPath(destination, &mut name[0])
-    };
-
-    if directory == NO_ENTRY {
-        result = FILE_NOT_FOUND;
-    } else if !IsValidName(&name[0] as *i8) || IsReservedName(&name[0] as *i8) {
-        result = FILE_BAD_NAME;
-    } else if is_directory && IsInside(IdOfIndex(directory), id) {
-        result = FILE_INTO_ITSELF;
-    } else {
-        let existing = FindChild(IdOfIndex(directory), &name[0] as *i8);
-
-        if existing != NO_ENTRY && GetFile(existing)->id != id {
-            if is_directory || IsDirectory(GetFile(existing) as *FileEntry) {
-                result = FILE_EXISTS;
-            } else {
-                RemoveEntry(existing);
-            }
-        }
-
-        if result == FILE_OK {
-            let file = GetFile(IndexOfId(id));
-            CopyName(&mut file->name[0], &name[0] as *i8);
-            file->parent = IdOfIndex(directory);
-            result = CommitOrRestore();
-        }
-    }
-
-    UnlockFileSystem();
-    result
-}
-
 fn CopyFile(source: *i8, destination: *i8) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    LockFileSystem();
-    let index = FindPath(source);
-    let mut name: [i8; 32];
-    let mut result = FILE_OK;
+    let mut result = Lookup(source, &mut scratch_info, null);
 
-    if index == NO_ENTRY || index == ROOT_ENTRY {
-        result = FILE_NOT_FOUND;
-    } else if IsDirectory(GetFile(index) as *FileEntry) {
-        result = FILE_IS_DIRECTORY;
-    } else {
-        let file = GetFile(index) as *FileEntry;
-        let size = file->size;
-        let data = Allocate(if size == 0 { 1 } else { size });
-        let directory = FindDestination(destination, FileName(file), &mut name[0]);
+    if result == FILE_OK && IsFolder(&scratch_info) {
+        result = FILE_IS_FOLDER;
+    }
 
-        if data == null {
-            result = FILE_NO_MEMORY;
-        } else if directory == NO_ENTRY {
-            result = FILE_NOT_FOUND;
+    if result != FILE_OK {
+        return Finish(result);
+    }
+
+    let size = scratch_info.size;
+    let data = Allocate(if size == 0 { 1 } else { size });
+
+    if data == null {
+        return Finish(FILE_NO_MEMORY);
+    }
+
+    if ReadData(&mut scratch_info, 0, data, size) != size {
+        result = FILE_IO_ERROR;
+    }
+
+    let mut name: [i8; 256];
+
+    if result == FILE_OK {
+        if Lookup(destination, &mut scratch_parent, null) == FILE_OK && IsFolder(&scratch_parent) {
+            CopyText(&mut name[0], &scratch_info.name[0] as *i8, FILE_NAME_LENGTH);
         } else {
-            ReadFileData(file, 0, data, size);
-            result = WriteFileIn(directory, &name[0] as *i8, data as *u8, size);
-        }
-
-        if data != null {
-            Free(data);
+            result = LookupParent(destination, &mut scratch_parent, &mut name[0], null);
         }
     }
 
-    UnlockFileSystem();
-    result
+    if result == FILE_OK {
+        result = WriteInto(&mut scratch_parent, &name[0] as *i8, data as *u8, size);
+    }
+
+    Free(data);
+    Finish(result)
 }
 
-fn ChangeDirectory(path: *i8) -> u32 {
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
+fn ChangeFolder(path: *i8) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    let index = FindPath(path);
+    let mut result = Lookup(path, &mut scratch_info, &mut scratch_canonical[0]);
 
-    if index == NO_ENTRY {
-        return FILE_NOT_FOUND;
+    if result == FILE_OK && !IsFolder(&scratch_info) {
+        result = FILE_NOT_FOLDER;
     }
 
-    if !IsDirectoryIndex(index) {
-        return FILE_NOT_DIRECTORY;
+    if result == FILE_OK {
+        CopyText(&mut current_path[0], &scratch_canonical[0] as *i8, MAX_PATH);
     }
 
-    current_directory = IdOfIndex(index);
-    FILE_OK
+    Finish(result)
 }
 
-fn FormatFileSystem(block_count: u32) -> u32 {
-    if file_table == null {
-        file_table = Allocate(TABLE_SIZE);
+fn CurrentFolder() -> *i8 {
+    &current_path[0] as *i8
+}
+
+fn FileSystemStatistics(total: *mut u32, free: *mut u32, bytes: *mut u32) -> u32 {
+    let start = Begin();
+
+    if start != FILE_OK {
+        return start;
     }
 
-    LockFileSystem();
-    let table = Table();
-    (table->magic, table->version, table->count, table->block_count) = (FILE_SYSTEM_MAGIC, FILE_SYSTEM_VERSION, 0, block_count);
-    (table->sequence, table->next_id, table->next_block) = (0, 1, TABLE_BLOCKS);
-    current_directory = ROOT_DIRECTORY;
+    if free_clusters == UNKNOWN_COUNT {
+        let counted = CountFreeClusters();
 
-    let mut erased = true;
-    let mut block: u32 = 0;
-
-    while block < TABLE_BLOCKS && erased {
-        erased = EraseFlashSector(BlockOffset(block));
-        block += 1;
+        if !io_failed {
+            (free_clusters, information_dirty) = (counted, true);
+        }
     }
 
-    (current_table, current_offset, table_end) = (0, 0, 0);
-    file_system_ready = erased && CommitTable();
-    UnlockFileSystem();
-    if file_system_ready { FILE_OK } else { FILE_WRITE_FAILED }
+    (*total, *free, *bytes) = (cluster_count, free_clusters, cluster_bytes);
+    Finish(FILE_OK)
 }
 
 fn FileErrorMessage(error: u32) -> *i8 {
     if error == FILE_NO_FILE_SYSTEM {
-        "There is no file system, format makes one."
+        "There is no SD card with a FAT32 or exFAT file system."
     } else if error == FILE_NOT_FOUND {
-        "There is no such file or directory."
+        "There is no such file or folder."
     } else if error == FILE_BAD_NAME {
-        "A name must have 1 to 31 characters without spaces or slashes."
-    } else if error == FILE_TABLE_FULL {
-        "There is no room for another entry."
+        "That name is not allowed."
+    } else if error == FILE_NO_SHORT_NAME {
+        "There is no free short name in that folder."
     } else if error == FILE_NO_SPACE {
         "There is not enough free space."
-    } else if error == FILE_WRITE_FAILED {
-        "Writing to the flash failed."
-    } else if error == FILE_NOT_DIRECTORY {
-        "That is not a directory."
-    } else if error == FILE_IS_DIRECTORY {
-        "That is a directory."
+    } else if error == FILE_IO_ERROR {
+        "The SD card did not answer."
+    } else if error == FILE_NOT_FOLDER {
+        "That is not a folder."
+    } else if error == FILE_IS_FOLDER {
+        "That is a folder."
     } else if error == FILE_NOT_EMPTY {
-        "The directory is not empty."
+        "The folder is not empty."
     } else if error == FILE_EXISTS {
         "There is already something with that name."
     } else if error == FILE_INTO_ITSELF {
-        "A directory cannot go into itself."
+        "A folder cannot go into itself."
     } else if error == FILE_NO_MEMORY {
         "There is not enough memory."
     } else if error == FILE_BAD_HANDLE {

@@ -33,9 +33,8 @@ struct Handle {
     pub dirty: bool,
     pub owner: u32,
     pub mode: u32,
-    pub id: u32,
-    pub parent: u32,
-    pub name: [i8; 32],
+    pub path: [i8; 256],
+    pub file: FileInfo,
     pub position: u32,
     pub data: *mut u8,
     pub size: u32,
@@ -103,13 +102,13 @@ fn IsOwnedHandle(slot: u32) -> bool {
     slot < MAX_HANDLES && handles[slot as usize].used && handles[slot as usize].owner == current_process
 }
 
-fn IsOpenForWriting(parent: u32, name: *i8) -> bool {
+fn IsOpenForWriting(path: *i8) -> bool {
     let mut slot: u32 = 0;
 
     while slot < MAX_HANDLES {
         let handle = &mut handles[slot as usize];
 
-        if handle.used && handle.mode != OPEN_READ && handle.parent == parent && Equals(&handle.name[0] as *i8, name) {
+        if handle.used && handle.mode != OPEN_READ && SameName(&handle.path[0] as *i8, path) {
             return true;
         }
 
@@ -149,52 +148,38 @@ fn ReserveCapacity(slot: u32, needed: u32) -> bool {
 }
 
 fn OpenForReading(slot: u32, path: *i8) -> u32 {
-    let index = FindPath(path);
-
-    if index == NO_ENTRY {
-        return FILE_NOT_FOUND;
-    }
-
-    if IsDirectoryIndex(index) {
-        return FILE_IS_DIRECTORY;
-    }
-
     let handle = &mut handles[slot as usize];
+    let code = FindFile(path, &mut handle.file);
+
+    if code != FILE_OK {
+        return code;
+    }
+
+    if IsFolder(&handle.file) {
+        return FILE_IS_FOLDER;
+    }
+
     handle.mode = OPEN_READ;
-    handle.id = GetFile(index)->id;
     FILE_OK
 }
 
 fn OpenForWriting(slot: u32, path: *i8, mode: u32) -> u32 {
-    let mut name: [i8; 32];
-    let directory = SplitPath(path, &mut name[0]);
+    let mut exists = false;
+    let code = PrepareWrite(path, &mut handles[slot as usize].path[0], &mut handles[slot as usize].file, &mut exists);
 
-    if directory == NO_ENTRY {
+    if code != FILE_OK {
+        return code;
+    }
+
+    if !exists && mode == OPEN_UPDATE {
         return FILE_NOT_FOUND;
     }
 
-    let file_name = &name[0] as *i8;
-
-    if !IsValidName(file_name) || IsReservedName(file_name) {
-        return FILE_BAD_NAME;
-    }
-
-    let parent = IdOfIndex(directory);
-    let index = FindChild(parent, file_name);
-
-    if index != NO_ENTRY && IsDirectory(GetFile(index) as *FileEntry) {
-        return FILE_IS_DIRECTORY;
-    }
-
-    if index == NO_ENTRY && mode == OPEN_UPDATE {
-        return FILE_NOT_FOUND;
-    }
-
-    if IsOpenForWriting(parent, file_name) {
+    if IsOpenForWriting(&handles[slot as usize].path[0] as *i8) {
         return FILE_BUSY;
     }
 
-    let size = if index != NO_ENTRY && mode != OPEN_WRITE { GetFile(index)->size } else { 0 };
+    let size = if exists && mode != OPEN_WRITE { handles[slot as usize].file.size } else { 0 };
 
     if !ReserveCapacity(slot, size) {
         return FILE_NO_MEMORY;
@@ -202,12 +187,10 @@ fn OpenForWriting(slot: u32, path: *i8, mode: u32) -> u32 {
 
     let handle = &mut handles[slot as usize];
 
-    if size > 0 {
-        ReadFileData(GetFile(index) as *FileEntry, 0, handle.data, size);
+    if size > 0 && ReadFileRange(&mut handle.file, 0, handle.data, size) != size {
+        return FILE_IO_ERROR;
     }
 
-    CopyName(&mut handle.name[0], file_name);
-    handle.parent = parent;
     handle.size = size;
     handle.position = if mode == OPEN_APPEND { size } else { 0 };
     handle.dirty = mode == OPEN_WRITE;
@@ -220,19 +203,13 @@ fn OpenFile(path: *i8, mode: u32, result: *mut u32) -> u32 {
         return FILE_NOT_ALLOWED;
     }
 
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
     let slot = ReserveHandle();
 
     if slot == MAX_HANDLES {
         return FILE_TOO_MANY;
     }
 
-    LockFileSystem();
     let code = if mode == OPEN_READ { OpenForReading(slot, path) } else { OpenForWriting(slot, path, mode) };
-    UnlockFileSystem();
 
     if code == FILE_OK {
         *result = slot;
@@ -250,14 +227,7 @@ fn CommitHandle(slot: u32) -> u32 {
         return FILE_OK;
     }
 
-    if !file_system_ready {
-        return FILE_NO_FILE_SYSTEM;
-    }
-
-    LockFileSystem();
-    let directory = IndexOfId(handle.parent);
-    let code = if IsDirectoryIndex(directory) { WriteFileIn(directory, &handle.name[0] as *i8, handle.data as *u8, handle.size) } else { FILE_NOT_FOUND };
-    UnlockFileSystem();
+    let code = WriteFile(&handle.path[0] as *i8, handle.data as *u8, handle.size);
 
     if code == FILE_OK {
         handle.dirty = false;
@@ -299,21 +269,8 @@ fn GetFileSize(slot: u32, size: *mut u32) -> u32 {
 
     let handle = &mut handles[slot as usize];
 
-    if handle.mode != OPEN_READ {
-        *size = handle.size;
-        return FILE_OK;
-    }
-
-    LockFileSystem();
-    let index = IndexOfId(handle.id);
-    let found = index != NO_ENTRY && index != ROOT_ENTRY;
-
-    if found {
-        *size = GetFile(index)->size;
-    }
-
-    UnlockFileSystem();
-    if found { FILE_OK } else { FILE_NOT_FOUND }
+    *size = if handle.mode != OPEN_READ { handle.size } else { handle.file.size };
+    FILE_OK
 }
 
 fn ReadHandle(slot: u32, buffer: *mut u8, count: u32, read: *mut u32) -> u32 {
@@ -340,16 +297,7 @@ fn ReadHandle(slot: u32, buffer: *mut u8, count: u32, read: *mut u32) -> u32 {
             CopyBytes(buffer, (handle.data + handle.position as usize) as *u8, length);
         }
     } else {
-        LockFileSystem();
-        let index = IndexOfId(handle.id);
-
-        if index == NO_ENTRY || index == ROOT_ENTRY {
-            UnlockFileSystem();
-            return FILE_NOT_FOUND;
-        }
-
-        length = ReadFileData(GetFile(index) as *FileEntry, handle.position, buffer, count);
-        UnlockFileSystem();
+        length = ReadFileRange(&mut handle.file, handle.position, buffer, count);
     }
 
     handle.position += length;

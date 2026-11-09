@@ -1,0 +1,315 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Devices.zir", "src/SPI.zir" : *]
+
+const SD_SPI_BASE: u32 = 0xFFB8;
+
+const SD_SLOW_DIVISOR: u32 = 68;
+const SD_FAST_DIVISOR: u32 = 2;
+const SD_SECTOR_SIZE: u32 = 512;
+
+const SD_INITIALIZE_TIMEOUT: u32 = 1000;
+const SD_READ_TIMEOUT: u32 = 200;
+const SD_WRITE_TIMEOUT: u32 = 500;
+
+static mut sd_ready: bool = false;
+static mut sd_block_addressing: bool = false;
+static mut sd_sectors: u32 = 0;
+static mut sd_port: SPIPort;
+
+fn SDTransfer(value: u32) -> u32 {
+    SPITransfer(&sd_port, value)
+}
+
+fn SDSelect() {
+    SPISelect(&sd_port);
+}
+
+fn SDDeselect() {
+    SPIDeselect(&sd_port);
+    SDTransfer(0xFF);
+}
+
+fn SDWaitReady(timeout: u32) -> bool {
+    let start = GetTime();
+
+    loop {
+        if SDTransfer(0xFF) == 0xFF {
+            return true;
+        }
+
+        if GetTime() - start > timeout {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn SDCommand(index: u32, argument: u32, crc: u32) -> u32 {
+    if index != 0 && !SDWaitReady(SD_WRITE_TIMEOUT) {
+        return 0xFF;
+    }
+
+    SDTransfer(0x40 | index);
+    SDTransfer(argument >> 24);
+    SDTransfer((argument >> 16) & 0xFF);
+    SDTransfer((argument >> 8) & 0xFF);
+    SDTransfer(argument & 0xFF);
+    SDTransfer(crc);
+
+    if index == 12 {
+        SDTransfer(0xFF);
+    }
+
+    let mut tries: u32 = 0;
+
+    while tries < 10 {
+        let response = SDTransfer(0xFF);
+
+        if (response & 0x80) == 0 {
+            return response;
+        }
+
+        tries += 1;
+    }
+
+    0xFF
+}
+
+fn SDApplicationCommand(index: u32, argument: u32) -> u32 {
+    let response = SDCommand(55, 0, 0x65);
+
+    if response > 1 {
+        return response;
+    }
+
+    SDCommand(index, argument, 0x77)
+}
+
+fn SDReadWord() -> u32 {
+    let mut value: u32 = 0;
+    let mut i: u32 = 0;
+
+    while i < 4 {
+        value = (value << 8) | SDTransfer(0xFF);
+        i += 1;
+    }
+
+    value
+}
+
+fn SDWaitToken() -> u32 {
+    let start = GetTime();
+
+    loop {
+        let token = SDTransfer(0xFF);
+
+        if token != 0xFF {
+            return token;
+        }
+
+        if GetTime() - start > SD_READ_TIMEOUT {
+            return 0xFF;
+        }
+    }
+
+    0xFF
+}
+
+fn SDReadBlock(buffer: *mut u8, length: u32) -> bool {
+    if SDWaitToken() != 0xFE {
+        return false;
+    }
+
+    let mut i: u32 = 0;
+
+    while i < length {
+        buffer[i as usize] = SDTransfer(0xFF) as u8;
+        i += 1;
+    }
+
+    SDTransfer(0xFF);
+    SDTransfer(0xFF);
+    true
+}
+
+fn SDReadCapacity() -> u32 {
+    let mut csd: [u8; 16];
+
+    if SDCommand(9, 0, 0xFF) != 0 || !SDReadBlock(&mut csd[0], 16) {
+        return 0;
+    }
+
+    if (csd[0] >> 6) == 1 {
+        let size = ((csd[7] as u32 & 0x3F) << 16) | (csd[8] as u32 << 8) | csd[9] as u32;
+        return (size + 1) * 1024;
+    }
+
+    let block_length = csd[5] as u32 & 0x0F;
+    let size = ((csd[6] as u32 & 0x03) << 10) | (csd[7] as u32 << 2) | (csd[8] as u32 >> 6);
+    let multiplier = ((csd[9] as u32 & 0x03) << 1) | (csd[10] as u32 >> 7);
+    if block_length < 9 { 0 } else { (size + 1) << (multiplier + 2 + block_length - 9) }
+}
+
+fn SDInitialize() -> bool {
+    sd_ready = false;
+    sd_port = MakeSPIPort(SD_SPI_BASE);
+    SPIConfigure(&mut sd_port, SPI_MODE_0, SD_SLOW_DIVISOR);
+
+    let mut i: u32 = 0;
+
+    while i < 10 {
+        SDTransfer(0xFF);
+        i += 1;
+    }
+
+    SDSelect();
+    let mut response: u32 = 0xFF;
+    i = 0;
+
+    while i < 10 && response != 1 {
+        response = SDCommand(0, 0, 0x95);
+        i += 1;
+    }
+
+    if response != 1 {
+        SDDeselect();
+        return false;
+    }
+
+    let mut version2 = false;
+
+    if SDCommand(8, 0x1AA, 0x87) == 1 {
+        if (SDReadWord() & 0xFFF) != 0x1AA {
+            SDDeselect();
+            return false;
+        }
+
+        version2 = true;
+    }
+
+    let start = GetTime();
+
+    loop {
+        response = SDApplicationCommand(41, if version2 { 0x40000000 } else { 0 });
+
+        if response == 0 {
+            break;
+        }
+
+        if response != 1 || GetTime() - start > SD_INITIALIZE_TIMEOUT {
+            SDDeselect();
+            return false;
+        }
+    }
+
+    sd_block_addressing = false;
+
+    if version2 && SDCommand(58, 0, 0xFF) == 0 {
+        sd_block_addressing = (SDReadWord() & 0x40000000) != 0;
+    }
+
+    if !sd_block_addressing && SDCommand(16, SD_SECTOR_SIZE, 0xFF) != 0 {
+        SDDeselect();
+        return false;
+    }
+
+    SPISetDivisor(&sd_port, SD_FAST_DIVISOR);
+    sd_sectors = SDReadCapacity();
+    SDDeselect();
+    sd_ready = true;
+    true
+}
+
+fn SDAddress(sector: u32) -> u32 {
+    if sd_block_addressing { sector } else { sector * SD_SECTOR_SIZE }
+}
+
+fn SDReadSectors(sector: u32, count: u32, buffer: *mut u8) -> bool {
+    if !sd_ready || count == 0 {
+        return sd_ready;
+    }
+
+    SDSelect();
+
+    if SDCommand(if count == 1 { 17 } else { 18 }, SDAddress(sector), 0xFF) != 0 {
+        SDDeselect();
+        return false;
+    }
+
+    let mut ok = true;
+    let mut i: u32 = 0;
+
+    while ok && i < count {
+        ok = SDReadBlock(buffer + (i * SD_SECTOR_SIZE) as usize, SD_SECTOR_SIZE);
+        i += 1;
+    }
+
+    if count > 1 {
+        SDCommand(12, 0, 0xFF);
+        ok = SDWaitReady(SD_WRITE_TIMEOUT) && ok;
+    }
+
+    SDDeselect();
+    ok
+}
+
+fn SDWriteBlock(token: u32, data: *u8) -> bool {
+    SDTransfer(0xFF);
+    SDTransfer(token);
+    let mut i: u32 = 0;
+
+    while i < SD_SECTOR_SIZE {
+        SDTransfer(data[i as usize] as u32);
+        i += 1;
+    }
+
+    SDTransfer(0xFF);
+    SDTransfer(0xFF);
+    (SDTransfer(0xFF) & 0x1F) == 0x05 && SDWaitReady(SD_WRITE_TIMEOUT)
+}
+
+fn SDWriteSectors(sector: u32, count: u32, data: *u8) -> bool {
+    if !sd_ready || count == 0 {
+        return sd_ready;
+    }
+
+    SDSelect();
+
+    if SDCommand(if count == 1 { 24 } else { 25 }, SDAddress(sector), 0xFF) != 0 {
+        SDDeselect();
+        return false;
+    }
+
+    let mut ok = true;
+    let mut i: u32 = 0;
+
+    while ok && i < count {
+        ok = SDWriteBlock(if count == 1 { 0xFE } else { 0xFC }, data + (i * SD_SECTOR_SIZE) as usize);
+        i += 1;
+    }
+
+    if count > 1 {
+        SDTransfer(0xFD);
+        SDTransfer(0xFF);
+        ok = SDWaitReady(SD_WRITE_TIMEOUT) && ok;
+    }
+
+    SDDeselect();
+    ok
+}
