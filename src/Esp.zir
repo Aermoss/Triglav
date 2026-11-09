@@ -21,6 +21,7 @@ const ESP_READY_TIMEOUT: u32 = 3000;
 const ESP_LINE_SIZE: usize = 256;
 const ESP_RESPONSE_SIZE: usize = 2048;
 const ESP_COMMAND_SIZE: usize = 192;
+const ESP_CLOSED: u32 = 0xFFFFFFFF;
 
 enum EspResult: u32 {
     Ok, Error, Fail, Timeout
@@ -297,10 +298,12 @@ fn EspSend(data: *u8, length: u32) -> bool {
     true
 }
 
-fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
+fn EspReceivePacket(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     let start = GetTime();
     let header = "+IPD,";
+    let closed = "CLOSED";
     let mut matched: usize = 0;
+    let mut closing: usize = 0;
 
     while header[matched] != '\0' {
         if !EspWaitByte(start, timeout) {
@@ -313,6 +316,16 @@ fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
             matched += 1;
         } else {
             matched = if character == '+' { 1 } else { 0 };
+        }
+
+        if character == closed[closing] {
+            closing += 1;
+
+            if closed[closing] == '\0' {
+                return ESP_CLOSED;
+            }
+        } else {
+            closing = if character == 'C' { 1 } else { 0 };
         }
     }
 
@@ -353,4 +366,9 @@ fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
     }
 
     if length < capacity { length } else { capacity }
+}
+
+fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
+    let length = EspReceivePacket(buffer, capacity, timeout);
+    if length == ESP_CLOSED { 0 } else { length }
 }

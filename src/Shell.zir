@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/Wifi.zir", "src/Clock.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/Wifi.zir", "src/Clock.zir", "src/Network.zir" : *]
 
 const LINE_LENGTH: usize = 128;
 const DUMP_LENGTH: u32 = 64;
@@ -54,6 +54,8 @@ fn CommandHelp() {
     WriteLine("wifi status              show the WiFi connection and the address");
     WriteLine("wifi disconnect          leave the WiFi network");
     WriteLine("ping <host> [count]      check that a host answers over WiFi");
+    WriteLine("host <name> [server]     look up the address of a name with DNS");
+    WriteLine("get <url> <file>         download a file over HTTP into the file system");
     WriteLine("date                     show the date and the time");
     WriteLine("date sync                get the time from the internet");
     WriteLine("date zone <hours>        set the time zone, for example +3");
@@ -734,6 +736,10 @@ fn RunCommand(line: *i8) {
         CommandDate(arguments);
     } else if ParseCommand(line, "ping", &mut arguments) {
         CommandPing(arguments);
+    } else if ParseCommand(line, "host", &mut arguments) {
+        CommandHost(arguments);
+    } else if ParseCommand(line, "get", &mut arguments) {
+        CommandGet(arguments);
     } else {
         let rest = ParseWord(line, &mut first_path[0], LINE_LENGTH as u32);
 
