@@ -29,6 +29,13 @@ const CYCLE_COUNTER: u32 = 0xFFE8;
 const INSTRUCTION_COUNTER: u32 = 0xFFE4;
 const TIMER_COMPARE: u32 = 0xFFDC;
 
+const ESP_DATA: u32 = 0xFFC8;
+const ESP_STATUS: u32 = 0xFFC4;
+const ESP_DIVISOR: u32 = 0xFFC0;
+const ESP_CONTROL: u32 = 0xFFBC;
+const ESP_ENABLE: u32 = 1;
+const ESP_RUN: u32 = 2;
+
 fn SetBaudRate(baud: u32) {
     *(UART_DIVISOR as *mut u32) = CLK_FREQ / baud;
 }

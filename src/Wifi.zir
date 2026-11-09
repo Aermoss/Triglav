@@ -1,0 +1,525 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Console.zir", "src/Strings.zir", "src/Process.zir", "src/Esp.zir" : *]
+
+const WIFI_FIELD_SIZE: usize = 64;
+
+static mut wifi_name: [i8; 64];
+static mut wifi_password: [i8; 64];
+static mut wifi_bssid: [i8; 64];
+
+fn TextStartsWith(mut text: *i8, mut prefix: *i8) -> *i8 {
+    while *prefix != '\0' {
+        if *text != *prefix {
+            return null;
+        }
+
+        text += 1;
+        prefix += 1;
+    }
+
+    text
+}
+
+fn ParseArgument(text: *i8, buffer: *mut i8, length: usize) -> *i8 {
+    let mut current = SkipSpaces(text);
+    let quoted = *current == '"';
+    let mut count: usize = 0;
+
+    if quoted {
+        current += 1;
+    }
+
+    while *current != '\0' && (if quoted { *current != '"' } else { *current != ' ' }) {
+        if count + 1 >= length {
+            return null;
+        }
+
+        buffer[count] = *current;
+        current += 1;
+        count += 1;
+    }
+
+    if quoted {
+        if *current != '"' {
+            return null;
+        }
+
+        current += 1;
+    }
+
+    buffer[count] = '\0';
+    if count == 0 && !quoted { null } else { current }
+}
+
+fn ParseQuotedField(text: *i8, buffer: *mut i8, length: usize) -> *i8 {
+    if text == null || *text != '"' {
+        return null;
+    }
+
+    let mut current = text + 1;
+    let mut count: usize = 0;
+
+    while *current != '\0' && *current != '"' {
+        if *current == '\\' && *(current + 1) != '\0' {
+            current += 1;
+        }
+
+        if count + 1 < length {
+            buffer[count] = *current;
+            count += 1;
+        }
+
+        current += 1;
+    }
+
+    buffer[count] = '\0';
+    if *current == '"' { current + 1 } else { null }
+}
+
+fn ParseSignedField(text: *i8, value: *mut i32) -> *i8 {
+    if text == null {
+        return null;
+    }
+
+    let mut current = text;
+    let negative = *current == '-';
+
+    if negative {
+        current += 1;
+    }
+
+    let start = current;
+    let mut result = 0;
+
+    while *current >= '0' && *current <= '9' {
+        result = result * 10 + (*current - '0') as i32;
+        current += 1;
+    }
+
+    if current == start {
+        return null;
+    }
+
+    *value = if negative { -result } else { result };
+    current
+}
+
+fn ExpectComma(text: *i8) -> *i8 {
+    if text != null && *text == ',' { text + 1 } else { null }
+}
+
+fn SignedLength(value: i32) -> u32 {
+    let mut magnitude = if value < 0 { (0 - value) as u32 } else { value as u32 };
+    let mut length: u32 = if value < 0 { 2 } else { 1 };
+
+    while magnitude >= 10 {
+        magnitude /= 10;
+        length += 1;
+    }
+
+    length
+}
+
+fn WriteSigned(value: i32) {
+    if value < 0 {
+        WriteCharacter('-');
+        WriteInteger((0 - value) as u32);
+    } else {
+        WriteInteger(value as u32);
+    }
+}
+
+fn WritePadding(used: u32, width: u32) {
+    let mut i = used;
+
+    while i < width {
+        WriteCharacter(' ');
+        i += 1;
+    }
+}
+
+fn TextLength(text: *i8) -> u32 {
+    let mut length: u32 = 0;
+
+    while text[length as usize] != '\0' {
+        length += 1;
+    }
+
+    length
+}
+
+fn SecurityName(value: i32) -> *i8 {
+    match value {
+        0 => "open",
+        1 => "WEP",
+        2 => "WPA",
+        3 => "WPA2",
+        4 => "WPA/WPA2",
+        5 => "WPA2-EAP",
+        _ => "unknown"
+    }
+}
+
+fn JoinFailure(code: i32) -> *i8 {
+    match code {
+        1 => "the connection timed out",
+        2 => "the password is wrong",
+        3 => "the network was not found",
+        _ => "the connection failed"
+    }
+}
+
+fn EspReady() -> bool {
+    if EspStart() {
+        return true;
+    }
+
+    WriteLine("ESP-01 did not answer, check the wiring and the power.");
+    false
+}
+
+fn ReportResult(result: EspResult) {
+    Write("ESP-01: ");
+    WriteLine(EspResultName(result));
+}
+
+fn StationMode() -> bool {
+    let result = EspCommand("AT+CWMODE=1", 2000);
+
+    if result != EspResult::Ok {
+        ReportResult(result);
+        return false;
+    }
+
+    true
+}
+
+fn WifiScan() {
+    if !EspReady() || !StationMode() {
+        return;
+    }
+
+    WriteLine("scanning...");
+    let result = EspCommand("AT+CWLAP", 15000);
+
+    if result != EspResult::Ok {
+        ReportResult(result);
+        return;
+    }
+
+    let mut offset: usize = 0;
+    let mut count: u32 = 0;
+
+    loop {
+        let line = EspNextLine(&mut offset);
+        if line == null { break; }
+
+        let (mut security, mut rssi, mut channel) = (0, 0, 0);
+        let mut current = ParseSignedField(TextStartsWith(line, "+CWLAP:("), &mut security);
+        current = ParseQuotedField(ExpectComma(current), &mut wifi_name[0], WIFI_FIELD_SIZE);
+        current = ParseSignedField(ExpectComma(current), &mut rssi);
+        current = ParseQuotedField(ExpectComma(current), &mut wifi_bssid[0], WIFI_FIELD_SIZE);
+        current = ParseSignedField(ExpectComma(current), &mut channel);
+
+        if current == null {
+            continue;
+        }
+
+        if count == 0 {
+            WriteLine("SIGNAL   CH  SECURITY  NAME");
+        }
+
+        WriteSigned(rssi);
+        Write(" dBm");
+        WritePadding(SignedLength(rssi) + 4, 9);
+        WritePadding(SignedLength(channel), 2);
+        WriteSigned(channel);
+        Write("  ");
+        let security_name = SecurityName(security);
+        Write(security_name);
+        WritePadding(TextLength(security_name), 10);
+        WriteLine(&wifi_name[0]);
+        count += 1;
+    }
+
+    if count == 0 {
+        WriteLine("no networks found");
+    }
+}
+
+fn WifiAddress() {
+    if EspCommand("AT+CIFSR", 2000) != EspResult::Ok {
+        return;
+    }
+
+    let mut offset: usize = 0;
+
+    loop {
+        let line = EspNextLine(&mut offset);
+        if line == null { break; }
+
+        if ParseQuotedField(TextStartsWith(line, "+CIFSR:STAIP,"), &mut wifi_bssid[0], WIFI_FIELD_SIZE) != null {
+            Write("address  ");
+            WriteLine(&wifi_bssid[0]);
+        } else if ParseQuotedField(TextStartsWith(line, "+CIFSR:STAMAC,"), &mut wifi_bssid[0], WIFI_FIELD_SIZE) != null {
+            Write("MAC      ");
+            WriteLine(&wifi_bssid[0]);
+        }
+    }
+}
+
+fn WifiConnect(arguments: *i8) {
+    let rest = ParseArgument(arguments, &mut wifi_name[0], WIFI_FIELD_SIZE);
+    wifi_password[0] = '\0';
+
+    if rest == null || wifi_name[0] == '\0' || (!AtEnd(rest) && ParseArgument(rest, &mut wifi_password[0], WIFI_FIELD_SIZE) == null) {
+        WriteLine("usage: wifi connect <name> [password]");
+        return;
+    }
+
+    if !EspReady() || !StationMode() {
+        return;
+    }
+
+    EspBeginCommand("AT+CWJAP=");
+    EspAppendQuoted(&wifi_name[0]);
+    EspAppendCharacter(',');
+    EspAppendQuoted(&wifi_password[0]);
+
+    if esp_command_overflow {
+        WriteLine("the name or the password is too long");
+        return;
+    }
+
+    Write("connecting to ");
+    WriteLine(&wifi_name[0]);
+    let result = EspCommand(&esp_command[0], 20000);
+
+    if result == EspResult::Ok {
+        WriteLine("connected");
+        WifiAddress();
+        return;
+    }
+
+    if result == EspResult::Fail {
+        let mut offset: usize = 0;
+        let mut code = 4;
+
+        loop {
+            let line = EspNextLine(&mut offset);
+            if line == null { break; }
+            ParseSignedField(TextStartsWith(line, "+CWJAP:"), &mut code);
+        }
+
+        WriteLine(JoinFailure(code));
+        return;
+    }
+
+    ReportResult(result);
+}
+
+fn WifiStatus() {
+    if !EspReady() {
+        return;
+    }
+
+    let result = EspCommand("AT+CWJAP?", 2000);
+
+    if result != EspResult::Ok {
+        ReportResult(result);
+        return;
+    }
+
+    let mut offset: usize = 0;
+
+    loop {
+        let line = EspNextLine(&mut offset);
+        if line == null { break; }
+
+        let (mut channel, mut rssi) = (0, 0);
+        let mut current = ParseQuotedField(TextStartsWith(line, "+CWJAP:"), &mut wifi_name[0], WIFI_FIELD_SIZE);
+        current = ParseQuotedField(ExpectComma(current), &mut wifi_bssid[0], WIFI_FIELD_SIZE);
+        current = ParseSignedField(ExpectComma(current), &mut channel);
+        current = ParseSignedField(ExpectComma(current), &mut rssi);
+
+        if current != null {
+            Write("connected to ");
+            WriteLine(&wifi_name[0]);
+            Write("signal   ");
+            WriteSigned(rssi);
+            Write(" dBm, channel ");
+            WriteSigned(channel);
+            WriteCharacter('\n');
+            WifiAddress();
+            return;
+        }
+    }
+
+    WriteLine("not connected");
+}
+
+fn WifiDisconnect() {
+    if !EspReady() {
+        return;
+    }
+
+    let result = EspCommand("AT+CWQAP", 2000);
+
+    if result == EspResult::Ok {
+        WriteLine("disconnected");
+    } else {
+        ReportResult(result);
+    }
+}
+
+fn CommandWifi(arguments: *i8) {
+    let mut rest = arguments;
+
+    if ParseCommand(arguments, "scan", &mut rest) {
+        WifiScan();
+    } else if ParseCommand(arguments, "connect", &mut rest) {
+        WifiConnect(rest);
+    } else if ParseCommand(arguments, "status", &mut rest) {
+        WifiStatus();
+    } else if ParseCommand(arguments, "disconnect", &mut rest) {
+        WifiDisconnect();
+    } else {
+        WriteLine("usage: wifi scan | connect <name> [password] | status | disconnect");
+    }
+}
+
+fn PingTime() -> u32 {
+    let mut offset: usize = 0;
+
+    loop {
+        let line = EspNextLine(&mut offset);
+        if line == null { break; }
+
+        let mut time = 0;
+        let mut start = TextStartsWith(line, "+PING:");
+
+        if start == null {
+            start = TextStartsWith(line, "+");
+        }
+
+        if ParseSignedField(start, &mut time) != null && time >= 0 {
+            return time as u32;
+        }
+    }
+
+    0xFFFFFFFF
+}
+
+fn CommandPing(arguments: *i8) {
+    let rest = ParseArgument(arguments, &mut wifi_name[0], WIFI_FIELD_SIZE);
+    let mut count: u32 = 4;
+
+    if rest == null || wifi_name[0] == '\0' || (!AtEnd(rest) && (ParseNumber(rest, &mut count) == null || count == 0 || count > 100)) {
+        WriteLine("usage: ping <host> [count, up to 100]");
+        return;
+    }
+
+    if !EspReady() {
+        return;
+    }
+
+    EspBeginCommand("AT+PING=");
+    EspAppendQuoted(&wifi_name[0]);
+
+    if esp_command_overflow {
+        WriteLine("the host name is too long");
+        return;
+    }
+
+    let (mut received, mut total, mut fastest, mut slowest): (u32, u32, u32, u32) = (0, 0, 0xFFFFFFFF, 0);
+    let mut rejected = false;
+
+    for i in 0..count {
+        if i > 0 {
+            Sleep(1000);
+        }
+
+        let started = GetTime();
+        let result = EspCommand(&esp_command[0], 6000);
+        let time = PingTime();
+
+        if result == EspResult::Ok && time != 0xFFFFFFFF {
+            Write("reply from ");
+            Write(&wifi_name[0]);
+            Write(": ");
+            WriteInteger(time);
+            WriteLine(" ms");
+            received += 1;
+            total += time;
+            if time < fastest { fastest = time; }
+            if time > slowest { slowest = time; }
+        } else {
+            WriteLine("no reply");
+            rejected |= result == EspResult::Error && esp_response_length == 0 && GetTime() - started < 100;
+        }
+    }
+
+    WriteInteger(count);
+    Write(" sent, ");
+    WriteInteger(received);
+    Write(" received");
+
+    if received > 0 {
+        Write(", min/avg/max ");
+        WriteInteger(fastest);
+        WriteCharacter('/');
+        WriteInteger(total / received);
+        WriteCharacter('/');
+        WriteInteger(slowest);
+        Write(" ms");
+    }
+
+    WriteCharacter('\n');
+
+    if rejected {
+        WriteLine("the ESP-01 rejected AT+PING right away, its firmware may not support it");
+    }
+}
+
+fn CommandEsp(arguments: *i8) {
+    let mut rest = arguments;
+
+    if AtEnd(arguments) {
+        WriteLine("usage: esp on | off | reset | <AT command>");
+    } else if ParseCommand(arguments, "on", &mut rest) {
+        if EspReady() { WriteLine("ESP-01 is ready"); }
+    } else if ParseCommand(arguments, "off", &mut rest) {
+        EspStop();
+        WriteLine("ESP-01 is off");
+    } else if ParseCommand(arguments, "reset", &mut rest) {
+        EspStop();
+        Sleep(50);
+        if EspReady() { WriteLine("ESP-01 is ready"); }
+    } else if EspReady() {
+        let result = EspCommand(arguments, 10000);
+        let mut offset: usize = 0;
+
+        loop {
+            let line = EspNextLine(&mut offset);
+            if line == null { break; }
+            WriteLine(line);
+        }
+
+        WriteLine(EspResultName(result));
+    }
+}

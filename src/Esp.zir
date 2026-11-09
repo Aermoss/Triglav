@@ -1,0 +1,356 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "src/Devices.zir", "src/Strings.zir", "src/Process.zir" : *]
+
+const ESP_BAUD_RATE: u32 = 115200;
+const ESP_READY_TIMEOUT: u32 = 3000;
+const ESP_LINE_SIZE: usize = 256;
+const ESP_RESPONSE_SIZE: usize = 2048;
+const ESP_COMMAND_SIZE: usize = 192;
+
+enum EspResult: u32 {
+    Ok, Error, Fail, Timeout
+}
+
+static mut esp_running: bool = false;
+static mut esp_line: [i8; 256];
+static mut esp_response: [i8; 2048];
+static mut esp_response_length: usize = 0;
+static mut esp_command: [i8; 192];
+static mut esp_command_length: usize = 0;
+static mut esp_command_overflow: bool = false;
+
+fn EspHasByte() -> bool {
+    (*(ESP_STATUS as *u32) & 1) != 0
+}
+
+fn EspReadByte() -> i8 {
+    *(ESP_DATA as *u32) as i8
+}
+
+fn EspWriteByte(value: i8) {
+    while (*(ESP_STATUS as *u32) & 2) != 0 {}
+    *(ESP_DATA as *mut u32) = value as u8 as u32;
+}
+
+fn EspFlush() {
+    while EspHasByte() {
+        EspReadByte();
+    }
+}
+
+fn EspReadLine(start: u32, timeout: u32) -> bool {
+    let mut length: usize = 0;
+
+    loop {
+        while !EspHasByte() {
+            if GetTime() - start >= timeout {
+                esp_line[length] = '\0';
+                return false;
+            }
+
+            Sleep(MILLISECONDS_PER_TICK);
+        }
+
+        let character = EspReadByte();
+
+        if character == '\n' {
+            esp_line[length] = '\0';
+            return true;
+        }
+
+        if character != '\r' && length + 1 < ESP_LINE_SIZE {
+            esp_line[length] = character;
+            length += 1;
+        }
+    }
+}
+
+fn EspLineEndsWith(suffix: *i8) -> bool {
+    let mut length: usize = 0;
+    let mut suffix_length: usize = 0;
+
+    while esp_line[length] != '\0' { length += 1; }
+    while suffix[suffix_length] != '\0' { suffix_length += 1; }
+
+    if suffix_length > length {
+        return false;
+    }
+
+    Equals(&esp_line[length - suffix_length], suffix)
+}
+
+fn EspStop() {
+    *(ESP_CONTROL as *mut u32) = 0;
+    esp_running = false;
+}
+
+fn EspStart() -> bool {
+    if esp_running {
+        return true;
+    }
+
+    *(ESP_DIVISOR as *mut u32) = CLK_FREQ / ESP_BAUD_RATE;
+    *(ESP_CONTROL as *mut u32) = ESP_ENABLE;
+    Sleep(20);
+    EspFlush();
+    *(ESP_CONTROL as *mut u32) = ESP_ENABLE | ESP_RUN;
+    let start = GetTime();
+
+    while EspReadLine(start, ESP_READY_TIMEOUT) {
+        if EspLineEndsWith("ready") {
+            esp_running = true;
+            break;
+        }
+    }
+
+    if !esp_running {
+        EspStop();
+        return false;
+    }
+
+    EspCommand("ATE0", 1000);
+    true
+}
+
+fn EspStoreLine() {
+    let mut i: usize = 0;
+
+    while esp_line[i] != '\0' {
+        i += 1;
+    }
+
+    if esp_response_length + i + 1 > ESP_RESPONSE_SIZE {
+        return;
+    }
+
+    for k in 0..(i + 1) {
+        esp_response[esp_response_length + k] = esp_line[k];
+    }
+
+    esp_response_length += i + 1;
+}
+
+fn EspCommand(command: *i8, timeout: u32) -> EspResult {
+    EspFlush();
+    let mut current = command;
+
+    while *current != '\0' {
+        EspWriteByte(*current);
+        current += 1;
+    }
+
+    EspWriteByte('\r');
+    EspWriteByte('\n');
+    esp_response_length = 0;
+    let start = GetTime();
+
+    while EspReadLine(start, timeout) {
+        if Equals(&esp_line[0], "OK") {
+            return EspResult::Ok;
+        } else if Equals(&esp_line[0], "ERROR") {
+            return EspResult::Error;
+        } else if Equals(&esp_line[0], "FAIL") {
+            return EspResult::Fail;
+        } else if esp_line[0] != '\0' {
+            EspStoreLine();
+        }
+    }
+
+    EspResult::Timeout
+}
+
+fn EspNextLine(offset: *mut usize) -> *i8 {
+    if *offset >= esp_response_length {
+        return null;
+    }
+
+    let line = &esp_response[*offset];
+
+    while esp_response[*offset] != '\0' {
+        *offset += 1;
+    }
+
+    *offset += 1;
+    line
+}
+
+fn EspBeginCommand(text: *i8) {
+    (esp_command_length, esp_command_overflow) = (0, false);
+    EspAppend(text);
+}
+
+fn EspAppendCharacter(character: i8) {
+    if esp_command_length + 1 >= ESP_COMMAND_SIZE {
+        esp_command_overflow = true;
+        return;
+    }
+
+    esp_command[esp_command_length] = character;
+    esp_command_length += 1;
+    esp_command[esp_command_length] = '\0';
+}
+
+fn EspAppend(mut text: *i8) {
+    while *text != '\0' {
+        EspAppendCharacter(*text);
+        text += 1;
+    }
+}
+
+fn EspAppendQuoted(mut text: *i8) {
+    EspAppendCharacter('"');
+
+    while *text != '\0' {
+        if *text == '"' || *text == ',' || *text == '\\' {
+            EspAppendCharacter('\\');
+        }
+
+        EspAppendCharacter(*text);
+        text += 1;
+    }
+
+    EspAppendCharacter('"');
+}
+
+fn EspResultName(result: EspResult) -> *i8 {
+    match result {
+        EspResult::Ok => "OK",
+        EspResult::Error => "ERROR",
+        EspResult::Fail => "FAIL",
+        EspResult::Timeout => "no answer"
+    }
+}
+
+fn EspAppendNumber(value: u32) {
+    if value >= 10 {
+        EspAppendNumber(value / 10);
+    }
+
+    EspAppendCharacter('0' + (value % 10) as i8);
+}
+
+fn EspWaitByte(start: u32, timeout: u32) -> bool {
+    while !EspHasByte() {
+        if GetTime() - start >= timeout {
+            return false;
+        }
+
+        Sleep(MILLISECONDS_PER_TICK);
+    }
+
+    true
+}
+
+fn EspOpen(kind: *i8, host: *i8, port: u32) -> EspResult {
+    EspBeginCommand("AT+CIPSTART=");
+    EspAppendQuoted(kind);
+    EspAppendCharacter(',');
+    EspAppendQuoted(host);
+    EspAppendCharacter(',');
+    EspAppendNumber(port);
+    EspCommand(&esp_command[0], 10000)
+}
+
+fn EspClose() {
+    EspCommand("AT+CIPCLOSE", 2000);
+}
+
+fn EspSend(data: *u8, length: u32) -> bool {
+    EspBeginCommand("AT+CIPSEND=");
+    EspAppendNumber(length);
+
+    if EspCommand(&esp_command[0], 2000) != EspResult::Ok {
+        return false;
+    }
+
+    let start = GetTime();
+
+    loop {
+        if !EspWaitByte(start, 2000) {
+            return false;
+        }
+
+        if EspReadByte() == '>' {
+            break;
+        }
+    }
+
+    for i in 0..length {
+        EspWriteByte(data[i as usize] as i8);
+    }
+
+    true
+}
+
+fn EspReceive(buffer: *mut u8, capacity: u32, timeout: u32) -> u32 {
+    let start = GetTime();
+    let header = "+IPD,";
+    let mut matched: usize = 0;
+
+    while header[matched] != '\0' {
+        if !EspWaitByte(start, timeout) {
+            return 0;
+        }
+
+        let character = EspReadByte();
+
+        if character == header[matched] {
+            matched += 1;
+        } else {
+            matched = if character == '+' { 1 } else { 0 };
+        }
+    }
+
+    let mut length: u32 = 0;
+
+    loop {
+        if !EspWaitByte(start, timeout) {
+            return 0;
+        }
+
+        let character = EspReadByte();
+
+        if character == ':' {
+            break;
+        } else if character == ',' {
+            length = 0;
+        } else if character >= '0' && character <= '9' {
+            length = length * 10 + (character - '0') as u32;
+        } else {
+            return 0;
+        }
+    }
+
+    let mut received: u32 = 0;
+
+    while received < length {
+        if !EspWaitByte(start, timeout) {
+            return 0;
+        }
+
+        let character = EspReadByte();
+
+        if received < capacity {
+            buffer[received as usize] = character as u8;
+        }
+
+        received += 1;
+    }
+
+    if length < capacity { length } else { capacity }
+}
