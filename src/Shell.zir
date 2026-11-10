@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/WiFi.zir", "src/Clock.zir", "src/Network.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Strings.zir", "src/Memory.zir", "src/Interrupts.zir", "src/Process.zir", "src/Animation.zir", "src/Programs.zir", "src/FileSystem.zir", "src/Executable.zir", "src/WiFi.zir", "src/Clock.zir", "src/Network.zir", "src/Completion.zir" : *]
 
 const LINE_LENGTH: usize = 128;
 const DUMP_LENGTH: u32 = 64;
@@ -653,6 +653,10 @@ fn CommandDiskFree() {
     WriteLine(" KB");
 }
 
+fn CompleteCommand(line: *i8, cursor: usize, output: *mut i8, length: usize, target: *mut usize) -> u32 {
+    CompleteLine("help echo uptime clear info peek poke dump heap alloc free anim ps run kill ls cat write rm mkdir cd pwd cp mv df esp wifi date ping host get", line, cursor, output, length, target)
+}
+
 fn RunCommand(line: *i8) {
     let mut arguments = line;
 
@@ -734,12 +738,36 @@ fn RunCommand(line: *i8) {
     }
 }
 
+const PROMPT_LENGTH: usize = 272;
+
+static mut shell_prompt: [i8; 272];
+
+fn MakePrompt() -> *i8 {
+    let (name, folder) = ("triglav:", CurrentFolder());
+    let (mut i, mut j): (usize, usize) = (0, 0);
+
+    while name[i] != '\0' {
+        shell_prompt[i] = name[i];
+        i += 1;
+    }
+
+    while folder[j] != '\0' && i + 3 < PROMPT_LENGTH {
+        shell_prompt[i] = folder[j];
+        i += 1;
+        j += 1;
+    }
+
+    shell_prompt[i] = '$';
+    shell_prompt[i + 1] = ' ';
+    shell_prompt[i + 2] = '\0';
+    &shell_prompt[0] as *i8
+}
+
 fn RunShell(argument: u32) {
     let mut line: [i8; LINE_LENGTH];
 
     loop {
-        Write("triglav> ");
-        ReadLine(&mut line[0], LINE_LENGTH);
+        ReadLine(MakePrompt(), &mut line[0], LINE_LENGTH, CompleteCommand);
         AddHistory(&line[0] as *i8);
         RunCommand(&line[0] as *i8);
     }

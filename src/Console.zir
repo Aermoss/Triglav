@@ -318,14 +318,39 @@ fn ReplaceLine(buffer: *mut i8, length: usize, cursor: usize, count: usize, text
     new_count
 }
 
-fn ReadLine(buffer: *mut i8, length: usize) -> usize {
+const COMPLETION_NONE: u32 = 0;
+const COMPLETION_CHANGED: u32 = 1;
+const COMPLETION_LISTED: u32 = 2;
+const COMPLETION_LINE_LENGTH: usize = 256;
+
+type LineCompleter = fn(*i8, usize, *mut i8, usize, *mut usize) -> u32;
+
+static mut completion_line: [i8; 256];
+
+fn ReadLine(prompt: *i8, buffer: *mut i8, length: usize, complete: LineCompleter) -> usize {
     let mut count: usize = 0;
     let mut cursor: usize = 0;
     let mut age: u32 = 0;
+    Write(prompt);
     let mut key = ReadKey();
 
     while key != '\r' && key != '\n' {
-        if key == KEY_UP && age < history_count {
+        if key == '\t' {
+            buffer[count] = '\0';
+            let mut target = cursor;
+            let capacity = if length < COMPLETION_LINE_LENGTH { length } else { COMPLETION_LINE_LENGTH };
+            let result = complete(buffer as *i8, cursor, &mut completion_line[0], capacity, &mut target);
+
+            if result == COMPLETION_CHANGED {
+                count = ReplaceLine(buffer, length, cursor, count, &completion_line[0] as *i8);
+                cursor = target;
+                MoveCursorLeft(Columns(buffer as *i8, cursor, count));
+            } else if result == COMPLETION_LISTED {
+                Write(prompt);
+                WriteCharacters(buffer, 0, count);
+                MoveCursorLeft(Columns(buffer as *i8, cursor, count));
+            }
+        } else if key == KEY_UP && age < history_count {
             if age == 0 {
                 buffer[count] = '\0';
                 CopyLine(&mut history_draft[0], buffer as *i8, HISTORY_LINE_LENGTH);
