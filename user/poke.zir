@@ -1,0 +1,52 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir" : *]
+
+const SYSTEM_DEBUG_POKE: u32 = 33;
+
+fn DebugPoke(address: u32, value: u32) -> bool {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_DEBUG_POKE), a0(address), a1(value) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result == FILE_OK
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() != 3 {
+        WriteLine("Usage: poke <address> <value>");
+        return 1;
+    }
+
+    let (address_text, value_text) = (&args[1], &args[2]);
+    let address_parsed = if address_text.StartsWith("0x") { address_text.SubString(2).ToUnsignedInteger(16) } else { address_text.ToUnsignedInteger(10) };
+    let value_parsed = if value_text.StartsWith("0x") { value_text.SubString(2).ToUnsignedInteger(16) } else { value_text.ToUnsignedInteger(10) };
+
+    if address_parsed.IsNone() || value_parsed.IsNone() {
+        WriteLine("Usage: poke <address> <value>");
+        return 1;
+    }
+
+    if !DebugPoke(address_parsed.Unwrap(), value_parsed.Unwrap()) {
+        WriteLine("The address must be a multiple of 4.");
+        return 1;
+    }
+
+    0
+}

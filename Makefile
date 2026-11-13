@@ -47,10 +47,23 @@ $(eval $(call SVAROG_TOOL,svarog-strings,Strings,STRINGS))
 
 toolchain: files/zirconc files/svarog-as files/svarog-ld files/svarog-ar files/svarog-objdump files/svarog-nm files/svarog-strings
 
+USER_PROGRAMS := $(patsubst user/%.zir,files/bin/%,$(wildcard user/*.zir))
+
+bin/%.s: user/%.zir $(wildcard user/Common/*.zir)
+	$(COMPILER) $< -o $@ -S -target svarog-unknown-triglav -I$(ZIRCON_PATH)/include
+
+bin/%.o: bin/%.s
+	$(ASSEMBLER) $< -o $@
+
+files/bin/%: bin/%.o
+	$(LINKER) $< -o $@ --format=exe
+
+programs: $(USER_PROGRAMS)
+
 $(IMAGER): tools/Imager.zir
 	$(COMPILER) $< -o $@ -I$(ZIRCON_PATH)/include
 
-bin/Card.img: $(IMAGER) $(wildcard files/* files/*/* files/*/*/* $(ZIRCON_PATH)/include/*/*.zir $(ZIRCON_PATH)/include/*/*/*.zir $(ZIRCON_PATH)/include/*/*/*/*.zir)
+bin/Card.img: $(IMAGER) $(USER_PROGRAMS) $(wildcard files/* files/*/* files/*/*/* $(ZIRCON_PATH)/include/*/*.zir $(ZIRCON_PATH)/include/*/*/*.zir $(ZIRCON_PATH)/include/*/*/*/*.zir)
 	$< files include=$(ZIRCON_PATH)/include -o $@
 
 build: bin/Triglav.bin
@@ -59,4 +72,4 @@ emulate: bin/Triglav.bin bin/Card.img
 	$(EMULATOR) $(SVAROG_PATH)/boot.hex --flash=bin/Triglav.bin --sd=bin/Card.img --quiet
 
 clean:
-	del /Q files\zirconc files\svarog-as files\svarog-ld files\svarog-ar files\svarog-objdump files\svarog-nm files\svarog-strings src\Kernel.s bin\*
+	del /Q files\zirconc files\svarog-as files\svarog-ld files\svarog-ar files\svarog-objdump files\svarog-nm files\svarog-strings files\bin\* src\Kernel.s bin\*

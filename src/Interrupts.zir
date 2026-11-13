@@ -15,7 +15,7 @@
  */
 
 #[include "src/Devices.zir", "src/Trap.zir", "src/Memory.zir", "src/Console.zir", "src/FileSystem.zir", "src/Handles.zir", "src/Paging.zir",
-    "src/Process.zir", "src/Executable.zir" : *]
+    "src/Process.zir", "src/Executable.zir", "src/Services.zir" : *]
 
 const INTERRUPT_TIMER: u32 = 1;
 const INTERRUPT_UART: u32 = 2;
@@ -54,8 +54,22 @@ enum SystemCall: u32 {
     ListFolder = 18,
     CreateFolder = 19,
     RemoveFolder = 20,
-    Rename = 21,
-    Execute = 22,
+    ChangeFolder = 21,
+    Rename = 22,
+    Move = 23,
+    Copy = 24,
+    Execute = 25,
+    Spawn = 26,
+    Kill = 27,
+    ListProcesses = 28,
+    SystemInformation = 29,
+    DiskStatistics = 30,
+    HeapStatistics = 31,
+    DebugPeek = 32,
+    DebugPoke = 33,
+    DebugRead = 34,
+    SetAnimation = 35,
+    SetLEDs = 36,
     Unknown = 0xFFFFFFFF
 }
 
@@ -102,6 +116,26 @@ fn WriteFault(cause: TrapCause, frame: *Frame) {
 fn TerminateProcess(frame: *mut Frame) -> *mut Frame {
     WakeJoiningProcesses(current_process, FILE_CRASHED, 0);
     ReleaseProcess(current_process, false);
+    Schedule(frame)
+}
+
+fn InterruptForeground(frame: *mut Frame) -> *mut Frame {
+    let foreground = ForegroundProcesses();
+    let mut id: u32 = 1;
+
+    while id < MAX_PROCESSES {
+        if (foreground & (1u32 << id)) != 0 && id != current_process {
+            Kill(id);
+        }
+
+        id += 1;
+    }
+
+    if (foreground & (1u32 << current_process)) != 0 {
+        WakeJoiningProcesses(current_process, FILE_KILLED, 0);
+        ReleaseProcess(current_process, false);
+    }
+
     Schedule(frame)
 }
 
@@ -156,6 +190,15 @@ fn ValidateCall(call: SystemCall, frame: *Frame) -> bool {
         SystemCall::ListFolder => UserString(a0) && a2 <= MAX_LIST_ENTRIES && UserBufferOrNull(a1, a2 * LIST_ENTRY_SIZE, true) && UserWord(a3),
         SystemCall::Rename => UserString(a0) && UserString(a1),
         SystemCall::Execute => UserString(a0) && UserStringOrNull(a1) && UserBufferOrNull(a2, 4, true),
+        SystemCall::Spawn => UserString(a0) && UserStringOrNull(a1) && UserWord(a2),
+        SystemCall::ChangeFolder => UserString(a0),
+        SystemCall::ListProcesses => a1 <= MAX_PROCESSES && UserBufferOrNull(a0, a1 * sizeof(ProcessRecord) as u32, true) && UserWord(a2),
+        SystemCall::SystemInformation => UserBuffer(a0, sizeof(SystemInformation) as u32, true),
+        SystemCall::DiskStatistics => UserBuffer(a0, sizeof(DiskStatistics) as u32, true),
+        SystemCall::HeapStatistics => UserBuffer(a0, sizeof(HeapStatistics) as u32, true),
+        SystemCall::DebugPeek => UserWord(a1),
+        SystemCall::DebugRead => UserBuffer(a1, a2, true),
+        SystemCall::Move | SystemCall::Copy => UserString(a0) && UserString(a1),
         _ => true
     }
 }
@@ -172,7 +215,13 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
             return Schedule(frame);
         },
         TrapCause::UART => {
-            ReceiveCharacter();
+            let character = ReceiveCharacter();
+
+            if character == INTERRUPT_KEY && ForegroundProcesses() != 0 {
+                return InterruptForeground(frame);
+            }
+
+            StoreCharacter(character);
             let woken = WakeWaitingProcesses();
 
             if woken != NO_PROCESS {
@@ -277,8 +326,17 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                 SystemCall::RemoveFolder => {
                     frame->a0 = RemoveFolder(frame->a0 as *i8);
                 },
+                SystemCall::ChangeFolder => {
+                    frame->a0 = ChangeFolder(frame->a0 as *i8);
+                },
                 SystemCall::Rename => {
                     frame->a0 = RenamePath(frame->a0 as *i8, frame->a1 as *i8);
+                },
+                SystemCall::Move => {
+                    frame->a0 = MovePath(frame->a0 as *i8, frame->a1 as *i8);
+                },
+                SystemCall::Copy => {
+                    frame->a0 = CopyFile(frame->a0 as *i8, frame->a1 as *i8);
                 },
                 SystemCall::Execute => {
                     let mut child = NO_PROCESS;
@@ -291,6 +349,40 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                         process.state = ProcessState::Joining;
                         return Schedule(frame);
                     }
+                },
+                SystemCall::Spawn => {
+                    frame->a0 = SpawnFile(frame->a0 as *i8, frame->a1 as *i8, frame->a2 as *mut u32);
+                },
+                SystemCall::Kill => {
+                    frame->a0 = KillProcess(frame->a0);
+                },
+                SystemCall::ListProcesses => {
+                    frame->a0 = ListProcesses(frame->a0 as *mut ProcessRecord, frame->a1, frame->a2 as *mut u32);
+                },
+                SystemCall::SystemInformation => {
+                    frame->a0 = GetSystemInformation(frame->a0 as *mut SystemInformation);
+                },
+                SystemCall::DiskStatistics => {
+                    frame->a0 = GetDiskStatistics(frame->a0 as *mut DiskStatistics);
+                },
+                SystemCall::HeapStatistics => {
+                    frame->a0 = GetHeapStatisticsInto(frame->a0 as *mut HeapStatistics);
+                },
+                SystemCall::DebugPeek => {
+                    frame->a0 = DebugPeek(frame->a0, frame->a1 as *mut u32);
+                },
+                SystemCall::DebugPoke => {
+                    frame->a0 = DebugPoke(frame->a0, frame->a1);
+                },
+                SystemCall::DebugRead => {
+                    frame->a0 = DebugRead(frame->a0, frame->a1 as *mut u8, frame->a2);
+                },
+                SystemCall::SetAnimation => {
+                    frame->a0 = SetAnimationMode(frame->a0, frame->a1);
+                },
+                SystemCall::SetLEDs => {
+                    SetLEDs(frame->a0 as i8);
+                    frame->a0 = FILE_OK;
                 },
                 _ => {
                     frame->a0 = 0xFFFFFFFF;

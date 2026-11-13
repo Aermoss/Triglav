@@ -1,0 +1,44 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec" : *]
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    WriteLine("help                     show the commands");
+    WriteLine("echo <text>              print the text");
+    WriteLine("uptime                   show the time since boot");
+    WriteLine("clear                    clear the screen");
+    WriteLine("info                     show the memory map");
+    WriteLine("peek <address>           read a word");
+    WriteLine("poke <address> <value>   write a word");
+    WriteLine("dump <address> [length]  show memory as bytes");
+    WriteLine("heap                     show how much of the kernel heap is used");
+    WriteLine("anim <mode> [brightness] set the RGB LED animation, 0 to 4");
+    WriteLine("ps                       show the processes");
+    WriteLine("kill <pid>               stop a process");
+    WriteLine("counter                  count on the LEDs, an example to run in the background");
+    WriteLine("ls [path]                show a folder, quote paths with spaces");
+    WriteLine("cat <file>               print a file");
+    WriteLine("write <file> <text>      write the text into a file");
+    WriteLine("mkdir <path>             make a folder");
+    WriteLine("cd [path]                go into a folder, or to the root");
+    WriteLine("pwd                      show the current folder");
+    WriteLine("cp <source> <target>     copy a file");
+    WriteLine("mv <source> <target>     move or rename a file or a folder");
+    WriteLine("rm <path>                delete a file or an empty folder");
+    WriteLine("df                       show how much of the SD card is used");
+    0
+}

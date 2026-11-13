@@ -1,0 +1,96 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir", "Common/Format.zir" : *]
+
+const NAME_COLUMN: usize = 32;
+
+fn WriteEntry(name: &String, folder: bool, size: usize) {
+    if folder {
+        WriteLine(name + "/");
+    } else {
+        WriteLine(PadRight(name, NAME_COLUMN) + String::FromInteger(size as u32) + " bytes");
+    }
+}
+
+fn BaseName(path: &String) -> String {
+    let mut start: usize = 0;
+
+    for i in 0..path.Length() {
+        if path[i] == '/' && i + 1 < path.Length() {
+            start = i + 1;
+        }
+    }
+
+    path.SubString(start)
+}
+
+fn ListFile(path: &String) -> i32 {
+    let mut file = File();
+
+    if let Result<(), IOError>::Err(error) = file.Open(path, FileMode::Read) {
+        WriteLine(ErrorMessage(error));
+        return 1;
+    }
+
+    let size = match file.Size() {
+        Result<usize, IOError>::Ok(size) => size,
+        Result<usize, IOError>::Err(error) => {
+            WriteLine(ErrorMessage(error));
+            return 1;
+        }
+    };
+
+    let name = match AbsolutePath(path) {
+        Result<String, IOError>::Ok(canonical) => BaseName(canonical),
+        Result<String, IOError>::Err(_) => String(path)
+    };
+
+    WriteEntry(name, false, size);
+    0
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() > 2 {
+        WriteLine("Usage: ls [path]");
+        return 1;
+    }
+
+    let path = if args.Length() == 2 { args[1] } else { ".".ToString() };
+
+    if FileExists(path) {
+        return ListFile(path);
+    }
+
+    if !FolderExists(path) {
+        WriteLine(ErrorMessage(FILE_NOT_FOUND));
+        return 1;
+    }
+
+    match ListFolder(path) {
+        Result<Vector<FolderEntry>, IOError>::Ok(entries) => {
+            for entry in entries {
+                WriteEntry(entry.name, entry.kind == EntryKind::Folder, entry.size);
+            }
+
+            0
+        },
+        Result<Vector<FolderEntry>, IOError>::Err(error) => {
+            WriteLine(ErrorMessage(error));
+            1
+        }
+    }
+}

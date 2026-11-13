@@ -1,0 +1,80 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir", "Common/Format.zir" : *]
+
+const SYSTEM_DEBUG_READ: u32 = 34;
+
+fn DebugRead(address: u32, length: u32) -> Vector<u8> {
+    let mut bytes = Vector<u8>();
+    bytes.Resize(length as usize);
+    let buffer = bytes.Data();
+
+    volatile asm : a7(SYSTEM_DEBUG_READ), a0(address), a1(buffer), a2(length) -> {
+        ecall
+    } : memory;
+
+    bytes
+}
+
+const DUMP_LENGTH: u32 = 64;
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() != 2 && args.Length() != 3 {
+        WriteLine("Usage: dump <address> [length]");
+        return 1;
+    }
+
+    let address_text = &args[1];
+    let address_parsed = if address_text.StartsWith("0x") { address_text.SubString(2).ToUnsignedInteger(16) } else { address_text.ToUnsignedInteger(10) };
+    let mut length_parsed = Option<u32>::Some(DUMP_LENGTH);
+
+    if args.Length() == 3 {
+        let length_text = &args[2];
+        length_parsed = if length_text.StartsWith("0x") { length_text.SubString(2).ToUnsignedInteger(16) } else { length_text.ToUnsignedInteger(10) };
+    }
+
+    if address_parsed.IsNone() || length_parsed.IsNone() {
+        WriteLine("Usage: dump <address> [length]");
+        return 1;
+    }
+
+    let address = address_parsed.Unwrap();
+    let end = address + length_parsed.Unwrap();
+    let mut line = address;
+
+    while line < end {
+        let count = if end - line < 16 { end - line } else { 16 };
+        let bytes = DebugRead(line, count);
+        let mut text = Hexadecimal(line, 8) + ": ";
+        let mut characters = String();
+
+        for i in 0..16u32 {
+            if i < count {
+                let value = bytes[i as usize];
+                text += Hexadecimal(value as u32, 2) + " ";
+                characters += if value >= ' ' as u8 && value <= '~' as u8 { value as i8 } else { '.' };
+            } else {
+                text += "   ";
+            }
+        }
+
+        WriteLine(text + " " + characters);
+        line += 16;
+    }
+
+    0
+}

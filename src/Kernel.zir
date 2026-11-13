@@ -14,9 +14,37 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Memory.zir", "src/Process.zir", "src/Interrupts.zir", "src/Animation.zir", "src/FileSystem.zir", "src/Executable.zir", "src/Shell.zir" : *]
+#[include "src/Devices.zir", "src/Console.zir", "src/Memory.zir", "src/Process.zir", "src/Interrupts.zir", "src/Animation.zir", "src/FileSystem.zir", "src/Executable.zir", "src/Services.zir" : *]
 
-const SHELL_STACK_SIZE: u32 = 16384;
+const SHELL_PATH: *i8 = "/bin/shell";
+const SHELL_RETRY_DELAY: u32 = 1000;
+const INIT_STACK_SIZE: u32 = 16384;
+
+fn RunInit(argument: u32) {
+    loop {
+        let mut shell = NO_PROCESS;
+        let code = ExecuteFile(SHELL_PATH, "shell", &mut shell);
+
+        if code != FILE_OK {
+            Write("Cannot start ");
+            Write(SHELL_PATH);
+            Write(": ");
+            WriteLine(FileErrorMessage(code));
+            return;
+        }
+
+        while processes[shell as usize].state != ProcessState::Free && processes[shell as usize].state != ProcessState::Crashed {
+            Sleep(MILLISECONDS_PER_TICK);
+        }
+
+        if processes[shell as usize].state == ProcessState::Crashed {
+            Kill(shell);
+        }
+
+        WriteLine("The shell stopped, starting it again.");
+        Sleep(SHELL_RETRY_DELAY);
+    }
+}
 
 @nomangle
 fn Main(image_end: u32) {
@@ -27,7 +55,6 @@ fn Main(image_end: u32) {
     InitializeMemory(image_end);
     InitializeFileSystem();
     InitializeProcesses();
-    SpawnWithStack("shell", RunShell, 0, SHELL_STACK_SIZE);
     Spawn("anim", RunAnimation, 0);
     WriteLine("Triglav kernel started.");
 
@@ -36,11 +63,11 @@ fn Main(image_end: u32) {
         WriteInteger(sd_sectors / 2048);
         Write(" MB, ");
         WriteLine(FileSystemName());
+        init_process = SpawnWithStack("init", RunInit, 0, INIT_STACK_SIZE);
     } else {
-        WriteLine("No SD card with a FAT32 or exFAT file system was found.");
+        WriteLine("No SD card with a FAT32 or exFAT file system was found, so there is no shell to start.");
     }
 
-    WriteLine("Type help to see the commands.");
     InitializeInterrupts();
     Yield();
 

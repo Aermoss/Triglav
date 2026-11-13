@@ -14,30 +14,18 @@
  * limitations under the License.
  */
 
-#[include "src/Devices.zir", "src/Console.zir", "src/Process.zir" : *]
+#[include "Common/System.zir" : *]
 
-const COUNTER_INTERVAL: u32 = 10;
-
-static mut spin_count: u32 = 0;
-
-fn RunCounter(argument: u32) {
-    let mut count: u32 = 0;
-
-    loop {
-        SetLEDs(((count & 0x3F) ^ 0x3F) as i8);
-        count += 1;
-        Sleep(COUNTER_INTERVAL);
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() != 2 {
+        WriteLine("Usage: mkdir <path>");
+        return 1;
     }
-}
 
-fn RunHello(argument: u32) {
-    Write("Hello from process ");
-    WriteInteger(current_process);
-    WriteLine(".");
-}
-
-fn RunSpin(argument: u32) {
-    loop {
-        spin_count += 1;
+    if let Result<(), IOError>::Err(error) = CreateFolder(args[1]) {
+        WriteLine(ErrorMessage(error));
+        return 1;
     }
+
+    0
 }

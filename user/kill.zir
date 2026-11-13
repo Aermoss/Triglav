@@ -1,0 +1,51 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir" : *]
+
+const SYSTEM_KILL: u32 = 27;
+
+fn KillProcess(process: u32) -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_KILL), a0(process) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    let process = match if args.Length() == 2 { args[1].ToUnsignedInteger() } else { Option<u32>::None } {
+        Option<u32>::Some(process) => process,
+        Option<u32>::None => {
+            WriteLine("Usage: kill <pid>");
+            return 1;
+        }
+    };
+
+    let code = KillProcess(process);
+
+    if code == FILE_NOT_ALLOWED {
+        WriteLine("The idle process, init and kill itself cannot be stopped.");
+        return 1;
+    } else if code != FILE_OK {
+        WriteLine("There is no such process.");
+        return 1;
+    }
+
+    0
+}

@@ -1,0 +1,45 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir" : *]
+
+const SYSTEM_COPY: u32 = 24;
+
+fn CopyFile(source: &String, destination: &String) -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_COPY), a0(source.Data()), a1(destination.Data()) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() != 3 {
+        WriteLine("Usage: cp <source> <target>");
+        return 1;
+    }
+
+    let code = CopyFile(args[1], args[2]);
+
+    if code != FILE_OK {
+        WriteLine(ErrorMessage(code));
+        return 1;
+    }
+
+    0
+}

@@ -1,0 +1,700 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/file", "Common/System.zir" : *]
+
+const SYSTEM_CONSOLE_READ: u32 = 3;
+const SYSTEM_CHANGE_FOLDER: u32 = 21;
+const SYSTEM_EXECUTE: u32 = 25;
+const SYSTEM_SPAWN: u32 = 26;
+
+fn ReadCharacter() -> i8 {
+    let mut character: i8 = 0;
+    let mut count: u32 = 0;
+
+    while count != 1 {
+        volatile asm : a7(SYSTEM_CONSOLE_READ), a0(&mut character as *mut i8), a1(1) -> {
+            ecall
+        } -> a0(count) : memory;
+    }
+
+    character
+}
+
+fn ExecuteFile(path: &String, command_line: &String, status: &mut i32) -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_EXECUTE), a0(path.Data()), a1(command_line.Data()), a2(status as *mut i32) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+fn SpawnFile(path: &String, command_line: &String, process: &mut u32) -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_SPAWN), a0(path.Data()), a1(command_line.Data()), a2(process as *mut u32) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+fn ChangeFolder(path: &String) -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_CHANGE_FOLDER), a0(path.Data()) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+const KEY_HOME: i8 = '\x01';
+const KEY_LEFT: i8 = '\x02';
+const KEY_DELETE: i8 = '\x04';
+const KEY_END: i8 = '\x05';
+const KEY_RIGHT: i8 = '\x06';
+const KEY_DOWN: i8 = '\x0E';
+const KEY_UP: i8 = '\x10';
+const KEY_INTERRUPT: i8 = '\x03';
+
+const LINE_LIMIT: usize = 128;
+const HISTORY_SIZE: usize = 16;
+const COMMAND_FOLDER: *i8 = "/bin";
+const COMPLETION_SCREEN_COLUMNS: usize = 80;
+
+const COMPLETION_NONE: u32 = 0;
+const COMPLETION_CHANGED: u32 = 1;
+const COMPLETION_LISTED: u32 = 2;
+
+fn ReadKey() -> i8 {
+    let character = ReadCharacter();
+
+    if character != '\x1B' {
+        return character;
+    }
+
+    let kind = ReadCharacter();
+
+    if kind != '[' && kind != 'O' {
+        return '\0';
+    }
+
+    let mut number: u32 = 0;
+    let mut first = true;
+    let mut code = ReadCharacter();
+
+    while (code >= '0' && code <= '9') || code == ';' {
+        if code == ';' {
+            first = false;
+        } else if first {
+            number = number * 10 + (code - '0') as u32;
+        }
+
+        code = ReadCharacter();
+    }
+
+    if code == 'A' {
+        KEY_UP
+    } else if code == 'B' {
+        KEY_DOWN
+    } else if code == 'C' {
+        KEY_RIGHT
+    } else if code == 'D' {
+        KEY_LEFT
+    } else if code == 'H' || (code == '~' && (number == 1 || number == 7)) {
+        KEY_HOME
+    } else if code == 'F' || (code == '~' && (number == 4 || number == 8)) {
+        KEY_END
+    } else if code == '~' && number == 3 {
+        KEY_DELETE
+    } else {
+        '\0'
+    }
+}
+
+fn IsContinuation(character: i8) -> bool {
+    ((character as u8) & 0xC0) == 0x80
+}
+
+fn SequenceLength(character: i8) -> usize {
+    let value = character as u8;
+    if value >= 0xF0 && value < 0xF8 { 4 } else if value >= 0xE0 && value < 0xF0 { 3 } else if value >= 0xC0 && value < 0xE0 { 2 } else { 1 }
+}
+
+fn Columns(text: &String, start: usize, end: usize) -> usize {
+    let mut columns: usize = 0;
+
+    for i in start..end {
+        if !IsContinuation(text[i]) {
+            columns += 1;
+        }
+    }
+
+    columns
+}
+
+fn Columns(text: &String) -> usize {
+    Columns(text, 0, text.Length())
+}
+
+fn PreviousCharacter(text: &String, cursor: usize) -> usize {
+    let mut i = cursor - 1;
+
+    while i > 0 && IsContinuation(text[i]) {
+        i -= 1;
+    }
+
+    i
+}
+
+fn NextCharacter(text: &String, cursor: usize) -> usize {
+    let mut i = cursor + 1;
+
+    while i < text.Length() && IsContinuation(text[i]) {
+        i += 1;
+    }
+
+    i
+}
+
+fn Backspaces(count: usize) -> String {
+    '\x08' * count
+}
+
+fn DefaultUpcase(value: u32) -> u32 {
+    if (value >= 0x61 && value <= 0x7A) || (value >= 0xE0 && value <= 0xFE && value != 0xF7) {
+        value - 0x20
+    } else if value == 0xFF {
+        0x178
+    } else if (value >= 0x100 && value <= 0x12F) || (value >= 0x132 && value <= 0x137) || (value >= 0x14A && value <= 0x177) {
+        value & 0xFFFE
+    } else if ((value >= 0x139 && value <= 0x148) || (value >= 0x179 && value <= 0x17E)) && (value & 1) == 0 {
+        value - 1
+    } else {
+        value
+    }
+}
+
+fn NextCode(text: &String, index: *mut usize) -> u32 {
+    let bytes = text.Data() as *u8;
+    let first = bytes[*index] as u32;
+    let (mut code, mut extra): (u32, usize) = (first, 0);
+
+    if first >= 0xF0 && first < 0xF8 {
+        (code, extra) = (first & 0x07, 3);
+    } else if first >= 0xE0 && first < 0xF0 {
+        (code, extra) = (first & 0x0F, 2);
+    } else if first >= 0xC0 && first < 0xE0 {
+        (code, extra) = (first & 0x1F, 1);
+    }
+
+    for k in 1..(extra + 1) {
+        let next = if *index + k < text.Length() { bytes[*index + k] as u32 } else { 0 };
+
+        if (next & 0xC0) != 0x80 {
+            *index += 1;
+            return first;
+        }
+
+        code = (code << 6) | (next & 0x3F);
+    }
+
+    *index += extra + 1;
+    if code > 0xFFFF { code } else { DefaultUpcase(code) }
+}
+
+fn StartsWithName(name: &String, prefix: &String) -> bool {
+    let (mut i, mut j): (usize, usize) = (0, 0);
+
+    while j < prefix.Length() {
+        if i >= name.Length() || NextCode(name, &mut i) != NextCode(prefix, &mut j) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn CommonLength(left: &String, right: &String) -> usize {
+    let (mut i, mut j): (usize, usize) = (0, 0);
+
+    while i < left.Length() && j < right.Length() {
+        let start = i;
+
+        if NextCode(left, &mut i) != NextCode(right, &mut j) {
+            return start;
+        }
+    }
+
+    i
+}
+
+class Candidate {
+    pub name: String,
+    pub folder: bool = false;
+
+    Candidate(&mut this) {}
+
+    pub fn Width(&this) -> usize {
+        Columns(this.name) + if this.folder { 1 } else { 0 }
+    }
+
+    pub fn Text(&this) -> String {
+        if this.folder { this.name + "/" } else { String(this.name) }
+    }
+}
+
+class Completion {
+    pub kind: u32 = 0,
+    pub line: String,
+    pub cursor: usize = 0;
+
+    Completion(&mut this) {}
+}
+
+fn AddCandidates(candidates: &mut Vector<Candidate>, folder: &String, prefix: &String, files_only: bool) {
+    if let Result<Vector<FolderEntry>, IOError>::Ok(entries) = ListFolder(folder) {
+        for entry in entries {
+            let is_folder = entry.kind == EntryKind::Folder;
+
+            if (!files_only || !is_folder) && StartsWithName(entry.name, prefix) {
+                let mut candidate = Candidate();
+                candidate.name = entry.name;
+                candidate.folder = is_folder;
+                candidates.PushBack(candidate);
+            }
+        }
+    }
+}
+
+fn CollectCandidates(folder: &String, prefix: &String, commands: bool, builtins: &Vector<String>) -> Vector<Candidate> {
+    let mut candidates = Vector<Candidate>();
+
+    if commands {
+        for name in builtins {
+            if StartsWithName(name, prefix) {
+                let mut candidate = Candidate();
+                candidate.name = name;
+                candidates.PushBack(candidate);
+            }
+        }
+
+        let command_folder = COMMAND_FOLDER.ToString();
+        AddCandidates(candidates, command_folder, prefix, true);
+
+        if AbsolutePath(folder).UnwrapOr(String()) == command_folder {
+            return candidates;
+        }
+    }
+
+    AddCandidates(candidates, folder, prefix, false);
+    candidates
+}
+
+fn ListCandidates(candidates: &Vector<Candidate>, width: usize) {
+    let mut text = "\n".ToString();
+    let (mut column, mut written): (usize, usize) = (0, 0);
+
+    for candidate in candidates {
+        let mut start = column;
+
+        if start > 0 && start + width >= COMPLETION_SCREEN_COLUMNS {
+            text += '\n';
+            start = 0;
+            written = 0;
+        }
+
+        text += " " * (start - written);
+        text += candidate.Text();
+        written = start + candidate.Width();
+        column = start + width + 2;
+    }
+
+    WriteLine(text);
+}
+
+fn CompleteLine(line: &String, cursor: usize, builtins: &Vector<String>) -> Completion {
+    let mut result = Completion();
+    let (mut start, mut words): (usize, u32) = (0, 0);
+    let (mut inside, mut quoted, mut closed) = (false, false, false);
+
+    for i in 0..cursor {
+        let character = line[i];
+
+        if !inside {
+            if character != ' ' {
+                (inside, start, quoted, closed) = (true, i, character == '"', false);
+                words += 1;
+            }
+        } else if quoted && !closed {
+            closed = character == '"';
+        } else if character == ' ' {
+            inside = false;
+        }
+    }
+
+    if words == 0 || (inside && closed) {
+        return result;
+    }
+
+    if !inside {
+        (start, quoted) = (cursor, false);
+        words += 1;
+    }
+
+    let text_start = if quoted { start + 1 } else { start };
+    let mut slash = text_start;
+
+    for i in text_start..cursor {
+        if line[i] == '/' {
+            slash = i + 1;
+        }
+    }
+
+    let folder_text = line.SubString(text_start, slash - text_start);
+    let folder = if folder_text.Empty() { ".".ToString() } else if folder_text.Length() > 1 { folder_text.SubString(0, folder_text.Length() - 1) } else { String(folder_text) };
+    let prefix = line.SubString(slash, cursor - slash);
+    let candidates = CollectCandidates(folder, prefix, words == 1 && folder_text.Empty(), builtins);
+
+    if candidates.Empty() {
+        return result;
+    }
+
+    let mut common = String(candidates[0].name);
+    let mut width: usize = 0;
+
+    for candidate in candidates {
+        common = common.SubString(0, CommonLength(common, candidate.name));
+
+        if candidate.Width() > width {
+            width = candidate.Width();
+        }
+    }
+
+    let single = candidates.Length() == 1;
+
+    if !single && Columns(common) <= Columns(prefix) {
+        ListCandidates(candidates, width);
+        result.kind = COMPLETION_LISTED;
+        return result;
+    }
+
+    let open = quoted || common.Contains(' ');
+    let mut output = line.SubString(0, start);
+
+    if open {
+        output += '"';
+    }
+
+    output += folder_text;
+    output += common;
+
+    if single {
+        if candidates[0].folder {
+            output += '/';
+        } else {
+            if open {
+                output += '"';
+            }
+
+            output += ' ';
+        }
+    }
+
+    let target = output.Length();
+    output += line.SubString(cursor);
+
+    if output.Length() + 1 > LINE_LIMIT {
+        return result;
+    }
+
+    result.kind = COMPLETION_CHANGED;
+    result.line = output;
+    result.cursor = target;
+    result
+}
+
+class LineEditor {
+    history: Vector<String>,
+    line: String,
+    cursor: usize = 0;
+
+    LineEditor(&mut this) {}
+
+    pub fn AddHistory(&mut this, line: &String) {
+        if line.Empty() || (!this.history.Empty() && this.history[this.history.Length() - 1] == line) {
+            return;
+        }
+
+        this.history.PushBack(String(line));
+
+        if this.history.Length() > HISTORY_SIZE {
+            this.history.RemoveAt(0);
+        }
+    }
+
+    fn Insert(&mut this, bytes: &String) {
+        let tail = this.line.SubString(this.cursor);
+        this.line = this.line.SubString(0, this.cursor) + bytes + tail;
+        Write(bytes + tail + Backspaces(Columns(tail)));
+        this.cursor += bytes.Length();
+    }
+
+    fn Delete(&mut this, start: usize, end: usize) {
+        let tail = this.line.SubString(end);
+        this.line = this.line.SubString(0, start) + tail;
+        Write(tail + " " + Backspaces(Columns(tail) + 1));
+        this.cursor = start;
+    }
+
+    fn Replace(&mut this, text: &String) {
+        let old_columns = Columns(this.line);
+        let mut output = Backspaces(Columns(this.line, 0, this.cursor));
+        this.line = text.SubString(0, LINE_LIMIT - 1);
+        let new_columns = Columns(this.line);
+        output += this.line;
+
+        if old_columns > new_columns {
+            output += " " * (old_columns - new_columns) + Backspaces(old_columns - new_columns);
+        }
+
+        Write(output);
+        this.cursor = this.line.Length();
+    }
+
+    pub fn ReadLine(&mut this, prompt: &String, builtins: &Vector<String>) -> String {
+        this.line = String();
+        this.cursor = 0;
+        let mut age: usize = 0;
+        let mut draft = String();
+        Write(prompt);
+
+        loop {
+            let key = ReadKey();
+
+            if key == '\r' || key == '\n' {
+                break;
+            }
+
+            if key == KEY_INTERRUPT {
+                Write(this.line.SubString(this.cursor) + "^C");
+                this.line = String();
+                break;
+            }
+
+            let length = this.line.Length();
+
+            if key == '\t' {
+                let completion = CompleteLine(this.line, this.cursor, builtins);
+
+                if completion.kind == COMPLETION_CHANGED {
+                    this.Replace(completion.line);
+                    Write(Backspaces(Columns(this.line, completion.cursor, this.line.Length())));
+                    this.cursor = completion.cursor;
+                } else if completion.kind == COMPLETION_LISTED {
+                    Write(prompt + this.line + Backspaces(Columns(this.line, this.cursor, length)));
+                }
+            } else if key == KEY_UP && age < this.history.Length() {
+                if age == 0 {
+                    draft = String(this.line);
+                }
+
+                age += 1;
+                let text = String(this.history[this.history.Length() - age]);
+                this.Replace(text);
+            } else if key == KEY_DOWN && age > 0 {
+                age -= 1;
+                let text = if age == 0 { String(draft) } else { String(this.history[this.history.Length() - age]) };
+                this.Replace(text);
+            } else if key == KEY_LEFT && this.cursor > 0 {
+                this.cursor = PreviousCharacter(this.line, this.cursor);
+                Write("\x08");
+            } else if key == KEY_RIGHT && this.cursor < length {
+                let next = NextCharacter(this.line, this.cursor);
+                Write(this.line.SubString(this.cursor, next - this.cursor));
+                this.cursor = next;
+            } else if key == KEY_HOME {
+                Write(Backspaces(Columns(this.line, 0, this.cursor)));
+                this.cursor = 0;
+            } else if key == KEY_END {
+                Write(this.line.SubString(this.cursor));
+                this.cursor = length;
+            } else if (key == '\x08' || key == '\x7F') && this.cursor > 0 {
+                let start = PreviousCharacter(this.line, this.cursor);
+                Write("\x08");
+                this.Delete(start, this.cursor);
+            } else if key == KEY_DELETE && this.cursor < length {
+                let cursor = this.cursor;
+                this.Delete(cursor, NextCharacter(this.line, cursor));
+            } else if key >= ' ' && key != '\x7F' && length < LINE_LIMIT - 1 {
+                this.Insert(key.ToString());
+            } else if SequenceLength(key) > 1 {
+                let size = SequenceLength(key);
+                let mut bytes = key.ToString();
+                let mut valid = true;
+
+                while bytes.Length() < size && valid {
+                    let next = ReadCharacter();
+                    valid = IsContinuation(next);
+                    bytes += next;
+                }
+
+                if valid && length + size < LINE_LIMIT {
+                    this.Insert(bytes);
+                }
+            }
+        }
+
+        Write("\n");
+        String(this.line)
+    }
+}
+
+fn Prompt() -> String {
+    "triglav:" + AbsolutePath(".".ToString()).UnwrapOr("/".ToString()) + "$ "
+}
+
+fn FindCommand(name: &String) -> Option<String> {
+    if name.Contains('/') {
+        return if FileExists(name) { Option<String>::Some(String(name)) } else { Option<String>::None };
+    }
+
+    let command = "/bin/" + name;
+
+    if FileExists(command) {
+        Option<String>::Some(command)
+    } else if FileExists(name) {
+        Option<String>::Some(String(name))
+    } else {
+        Option<String>::None
+    }
+}
+
+fn Words(line: &String) -> Vector<String> {
+    let mut words = Vector<String>();
+    let mut word = String();
+    let (mut inside, mut quoted) = (false, false);
+
+    for i in 0..line.Length() {
+        let character = line[i];
+
+        if character == '"' {
+            (inside, quoted) = (true, !quoted);
+        } else if character == ' ' && !quoted {
+            if inside {
+                words.PushBack(word);
+                word = String();
+                inside = false;
+            }
+        } else {
+            word += character;
+            inside = true;
+        }
+    }
+
+    if inside {
+        words.PushBack(word);
+    }
+
+    words
+}
+
+fn RunCommand(input: &String) {
+    let mut line = input.Strip();
+    let background = line.EndsWith('&');
+
+    if background {
+        line = line.SubString(0, line.Length() - 1).Strip();
+    }
+
+    let words = Words(line);
+
+    if words.Empty() {
+        return;
+    }
+
+    let name = &words[0];
+
+    if name == "cd" {
+        if words.Length() > 2 {
+            WriteLine("Usage: cd [path]");
+            return;
+        }
+
+        let code = ChangeFolder(if words.Length() == 2 { String(words[1]) } else { "/".ToString() });
+
+        if code != FILE_OK {
+            WriteLine(ErrorMessage(code));
+        }
+
+        return;
+    }
+
+    let path = match FindCommand(name) {
+        Option<String>::Some(path) => path,
+        Option<String>::None => {
+            if FolderExists(name) {
+                WriteLine(ErrorMessage(FILE_IS_FOLDER));
+            } else {
+                WriteLine("Unknown command: " + name);
+            }
+
+            return;
+        }
+    };
+
+    if background {
+        let mut process: u32 = 0;
+        let code = SpawnFile(path, line, process);
+
+        if code == FILE_OK {
+            WriteLine("Started process " + String::FromInteger(process));
+        } else {
+            WriteLine(ErrorMessage(code));
+        }
+
+        return;
+    }
+
+    let mut status = 0i32;
+    let code = ExecuteFile(path, line, status);
+
+    if code == FILE_CRASHED {
+        WriteLine("Process crashed.");
+    } else if code == FILE_KILLED {
+        WriteLine("^C");
+    } else if code != FILE_OK {
+        WriteLine(ErrorMessage(code));
+    }
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    let mut builtins = Vector<String>();
+    builtins.PushBack("cd".ToString());
+    let mut editor = LineEditor();
+    WriteLine("Type help to see the commands.");
+
+    loop {
+        let line = editor.ReadLine(Prompt(), builtins);
+        editor.AddHistory(line);
+        RunCommand(line);
+    }
+
+    0
+}

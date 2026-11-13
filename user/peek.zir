@@ -1,0 +1,59 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Common/System.zir", "Common/Format.zir" : *]
+
+const SYSTEM_DEBUG_PEEK: u32 = 32;
+
+fn DebugPeek(address: u32) -> Option<u32> {
+    let mut value: u32 = 0;
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_DEBUG_PEEK), a0(address), a1(&mut value as *mut u32) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    if result == FILE_OK { Option<u32>::Some(value) } else { Option<u32>::None }
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() != 2 {
+        WriteLine("Usage: peek <address>");
+        return 1;
+    }
+
+    let text = &args[1];
+    let parsed = if text.StartsWith("0x") { text.SubString(2).ToUnsignedInteger(16) } else { text.ToUnsignedInteger(10) };
+
+    let address = match parsed {
+        Option<u32>::Some(address) => address,
+        Option<u32>::None => {
+            WriteLine("Usage: peek <address>");
+            return 1;
+        }
+    };
+
+    match DebugPeek(address) {
+        Option<u32>::Some(value) => {
+            WriteLine(Address(address) + ": " + Address(value));
+            0
+        },
+        Option<u32>::None => {
+            WriteLine("The address must be a multiple of 4.");
+            1
+        }
+    }
+}

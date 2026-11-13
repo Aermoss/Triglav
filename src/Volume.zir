@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#[include "src/Memory.zir", "src/Strings.zir", "src/Trap.zir", "src/Process.zir", "src/SD.zir", "src/Clock.zir" : *]
+#[include "src/Memory.zir", "src/Trap.zir", "src/Process.zir", "src/SD.zir" : *]
 
 const SECTOR_SIZE: u32 = 512;
 const ENTRY_SIZE: u32 = 32;
@@ -761,27 +761,7 @@ fn FindFreeEntries(folder: *mut FileInfo, needed: u32, start: *mut Cursor) -> bo
 }
 
 fn FatTimestamp() -> u32 {
-    if !clock_valid {
-        return (((2026 - 1980) << 9) | (1 << 5) | 1) << 16;
-    }
-
-    let zone_seconds = (if clock_zone < 0 { 0 - clock_zone } else { clock_zone }) as u32 * 3600;
-    let now = ClockNow();
-    let local = if clock_zone < 0 { now - zone_seconds } else { now + zone_seconds };
-    let days = local / 86400;
-    let rest = local % 86400;
-    let shifted = days + 719468;
-    let era = shifted / 146097;
-    let day_of_era = shifted - era * 146097;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
-    let year = year_of_era + era * 400 + (if month <= 2 { 1 } else { 0 });
-    let date = ((if year < 1980 { 0 } else { year - 1980 }) << 9) | (month << 5) | day;
-    let time = ((rest / 3600) << 11) | ((rest / 60 % 60) << 5) | (rest % 60 / 2);
-    (date << 16) | time
+    (((2026 - 1980) << 9) | (1 << 5) | 1) << 16
 }
 
 fn CreateEntry(folder: *mut FileInfo, name: *i8, attributes: u32, cluster: u32, size: u32, flags: u32, length: u32, info: *mut FileInfo) -> u32 {

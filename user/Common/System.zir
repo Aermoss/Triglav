@@ -1,0 +1,137 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/file" : *]
+
+const SYSTEM_INFORMATION: u32 = 29;
+
+struct SystemInformation {
+    pub clock_frequency: u32,
+    pub uptime: u32,
+    pub ticks: u32,
+    pub stacks_start: u32,
+    pub stacks_end: u32,
+    pub kernel_start: u32,
+    pub kernel_end: u32,
+    pub heap_start: u32,
+    pub heap_end: u32,
+    pub flash_start: u32,
+    pub flash_end: u32,
+    pub sd_sectors: u32,
+    pub cluster_bytes: u32,
+    pub flags: u32,
+    pub file_system: [i8; 16]
+}
+
+fn GetSystemInformation() -> SystemInformation {
+    let mut info: SystemInformation;
+
+    volatile asm : a7(SYSTEM_INFORMATION), a0(&mut info as *mut SystemInformation) -> {
+        ecall
+    } : memory;
+
+    info
+}
+
+const FILE_OK: u32 = 0;
+const FILE_NO_FILE_SYSTEM: u32 = 1;
+const FILE_NOT_FOUND: u32 = 2;
+const FILE_BAD_NAME: u32 = 3;
+const FILE_NO_SHORT_NAME: u32 = 4;
+const FILE_NO_SPACE: u32 = 5;
+const FILE_IO_ERROR: u32 = 6;
+const FILE_NOT_FOLDER: u32 = 7;
+const FILE_IS_FOLDER: u32 = 8;
+const FILE_NOT_EMPTY: u32 = 9;
+const FILE_EXISTS: u32 = 10;
+const FILE_INTO_ITSELF: u32 = 11;
+const FILE_NO_MEMORY: u32 = 12;
+const FILE_BAD_HANDLE: u32 = 13;
+const FILE_BUSY: u32 = 14;
+const FILE_NOT_ALLOWED: u32 = 15;
+const FILE_TOO_MANY: u32 = 16;
+const FILE_BAD_POSITION: u32 = 17;
+const FILE_NOT_EXECUTABLE: u32 = 18;
+const FILE_NO_PROCESS: u32 = 19;
+const FILE_CRASHED: u32 = 20;
+const FILE_KILLED: u32 = 21;
+const FILE_TOO_LONG: u32 = 22;
+
+fn ErrorMessage(error: u32) -> *i8 {
+    if error == FILE_NO_FILE_SYSTEM {
+        "There is no SD card with a FAT32 or exFAT file system."
+    } else if error == FILE_NOT_FOUND {
+        "There is no such file or folder."
+    } else if error == FILE_BAD_NAME {
+        "That name is not allowed."
+    } else if error == FILE_NO_SHORT_NAME {
+        "There is no free short name in that folder."
+    } else if error == FILE_NO_SPACE {
+        "There is not enough free space."
+    } else if error == FILE_IO_ERROR {
+        "The SD card did not answer."
+    } else if error == FILE_NOT_FOLDER {
+        "That is not a folder."
+    } else if error == FILE_IS_FOLDER {
+        "That is a folder."
+    } else if error == FILE_NOT_EMPTY {
+        "The folder is not empty."
+    } else if error == FILE_EXISTS {
+        "There is already something with that name."
+    } else if error == FILE_INTO_ITSELF {
+        "A folder cannot go into itself."
+    } else if error == FILE_NO_MEMORY {
+        "There is not enough memory."
+    } else if error == FILE_BAD_HANDLE {
+        "That is not an open file."
+    } else if error == FILE_BUSY {
+        "The file is already open for writing."
+    } else if error == FILE_NOT_ALLOWED {
+        "That is not allowed."
+    } else if error == FILE_TOO_MANY {
+        "There are too many open files."
+    } else if error == FILE_BAD_POSITION {
+        "That position is before the start of the file."
+    } else if error == FILE_NOT_EXECUTABLE {
+        "That is not a valid executable."
+    } else if error == FILE_NO_PROCESS {
+        "There is no room for another process."
+    } else if error == FILE_CRASHED {
+        "The process crashed."
+    } else if error == FILE_KILLED {
+        "The process was killed."
+    } else if error == FILE_TOO_LONG {
+        "The command line is too long."
+    } else {
+        "The operation succeeded."
+    }
+}
+
+fn ErrorMessage(error: &IOError) -> *i8 {
+    match error {
+        IOError::NotFound => ErrorMessage(FILE_NOT_FOUND),
+        IOError::PermissionDenied => ErrorMessage(FILE_BUSY),
+        IOError::AlreadyExists => ErrorMessage(FILE_EXISTS),
+        IOError::InvalidInput => ErrorMessage(FILE_BAD_NAME),
+        IOError::NotEmpty => ErrorMessage(FILE_NOT_EMPTY),
+        IOError::NoSpace => ErrorMessage(FILE_NO_SPACE),
+        IOError::IsFolder => ErrorMessage(FILE_IS_FOLDER),
+        IOError::NotFolder => ErrorMessage(FILE_NOT_FOLDER),
+        IOError::Other(code) => ErrorMessage(code as u32),
+        _ => "The operation failed."
+    }
+}
+

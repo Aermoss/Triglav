@@ -312,6 +312,23 @@ fn ExitProcess() {
     Yield();
 }
 
+fn ForegroundProcesses() -> u32 {
+    let mut foreground: u32 = 0;
+    let mut id: u32 = 1;
+
+    while id < MAX_PROCESSES {
+        let process = &processes[id as usize];
+
+        if process.state == ProcessState::Joining && process.child < MAX_PROCESSES && IsUserProcess(process.child) {
+            foreground |= 1u32 << process.child;
+        }
+
+        id += 1;
+    }
+
+    foreground
+}
+
 fn Kill(id: u32) -> bool {
     if id == 0 || id == current_process || id >= MAX_PROCESSES {
         return false;
