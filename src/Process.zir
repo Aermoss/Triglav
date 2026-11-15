@@ -176,7 +176,7 @@ fn Spawn(name: *i8, entry: ProcessEntry, argument: u32) -> u32 {
 }
 
 fn SpawnWithStack(name: *i8, entry: ProcessEntry, argument: u32, mut stack_size: u32) -> u32 {
-    if stack_size < sizeof(Frame) as u32 + 8 || stack_size > 0xFFFFFFF8 {
+    if stack_size < size_of<Frame>() as u32 + 8 || stack_size > 0xFFFFFFF8 {
         return NO_PROCESS;
     }
 
@@ -205,10 +205,10 @@ fn SpawnWithStack(name: *i8, entry: ProcessEntry, argument: u32, mut stack_size:
     }
 
     SetStack(id, stack, stack_size);
-    let frame = (stack + stack_size - sizeof(Frame) as u32) as *mut Frame;
+    let frame = (stack + stack_size - size_of<Frame>() as u32) as *mut Frame;
     let words = frame as *mut u32;
 
-    for i in 0..sizeof(Frame) / 4 {
+    for i in 0..size_of<Frame>() / 4 {
         words[i] = 0;
     }
 

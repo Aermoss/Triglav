@@ -47,7 +47,7 @@ static cp437_upper: [u16; 48] = [
 fn SetCell(row: u32, column: u32, character: u32) {
     let shown_row = (row + screen_scroll) % SCREEN_ROWS;
     let cell = (VIDEO_TEXT + (shown_row * SCREEN_COLUMNS + column) * 4) as *mut u32;
-    *cell = (screen_attribute << 8) | character;
+    volatile_write(cell, (screen_attribute << 8) | character);
 }
 
 fn ClearRow(row: u32, from: u32) {
@@ -60,12 +60,12 @@ fn ClearRow(row: u32, from: u32) {
 }
 
 fn UpdateCursor() {
-    *(VIDEO_CURSOR as *mut u32) = CURSOR_ON | (screen_row << 8) | screen_column;
+    volatile_write(VIDEO_CURSOR as *mut u32, CURSOR_ON | (screen_row << 8) | screen_column);
 }
 
 fn ClearScreen() {
     screen_scroll = 0;
-    *(VIDEO_SCROLL as *mut u32) = 0;
+    volatile_write(VIDEO_SCROLL as *mut u32, 0);
     let mut row: u32 = 0;
 
     while row < SCREEN_ROWS {
@@ -85,7 +85,7 @@ fn NewLine() {
     }
 
     screen_scroll = (screen_scroll + 1) % SCREEN_ROWS;
-    *(VIDEO_SCROLL as *mut u32) = screen_scroll;
+    volatile_write(VIDEO_SCROLL as *mut u32, screen_scroll);
     ClearRow(SCREEN_ROWS - 1, 0);
 }
 

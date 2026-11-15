@@ -31,7 +31,7 @@ struct ExecutableHeader {
 }
 
 fn SpawnExecutable(file: *mut FileInfo, arguments: *i8, process: *mut u32) -> ExecutableError {
-    let header_size = sizeof(ExecutableHeader) as u32;
+    let header_size = size_of<ExecutableHeader>() as u32;
 
     if file == null || file->size < header_size || (file->size & 3) != 0 {
         return ExecutableError::InvalidFormat;
@@ -82,7 +82,7 @@ fn SpawnExecutable(file: *mut FileInfo, arguments: *i8, process: *mut u32) -> Ex
 }
 
 fn LoadImage(id: u32, file: *mut FileInfo, header: *ExecutableHeader) -> ExecutableError {
-    let header_size = sizeof(ExecutableHeader) as u32;
+    let header_size = size_of<ExecutableHeader>() as u32;
     let code_size = header->code_words * 4;
     let root = CreateAddressSpace(id);
 

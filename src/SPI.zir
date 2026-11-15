@@ -39,24 +39,24 @@ fn MakeSPIPort(base: u32) -> SPIPort {
 
 fn SPIConfigure(port: *mut SPIPort, mode: u32, divisor: u32) {
     port->mode = mode & SPI_MODE_MASK;
-    *(port->control as *mut u32) = port->mode;
-    *(port->divisor as *mut u32) = divisor;
+    volatile_write(port->control as *mut u32, port->mode);
+    volatile_write(port->divisor as *mut u32, divisor);
 }
 
 fn SPISetDivisor(port: *SPIPort, divisor: u32) {
-    *(port->divisor as *mut u32) = divisor;
+    volatile_write(port->divisor as *mut u32, divisor);
 }
 
 fn SPISelect(port: *SPIPort) {
-    *(port->control as *mut u32) = port->mode | SPI_SELECT;
+    volatile_write(port->control as *mut u32, port->mode | SPI_SELECT);
 }
 
 fn SPIDeselect(port: *SPIPort) {
-    *(port->control as *mut u32) = port->mode;
+    volatile_write(port->control as *mut u32, port->mode);
 }
 
 fn SPITransfer(port: *SPIPort, value: u32) -> u32 {
-    *(port->data as *mut u32) = value;
-    while (*(port->control as *u32) & SPI_BUSY) != 0 {}
-    *(port->data as *u32) & 0xFF
+    volatile_write(port->data as *mut u32, value);
+    while (volatile_read(port->control as *u32) & SPI_BUSY) != 0 {}
+    volatile_read(port->data as *u32) & 0xFF
 }

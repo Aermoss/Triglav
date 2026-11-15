@@ -30,18 +30,18 @@ fn MakeUARTPort(data: u32, status: u32, divisor: u32) -> UARTPort {
 }
 
 fn UARTSetBaudRate(port: *UARTPort, baud: u32) {
-    *(port->divisor as *mut u32) = CLK_FREQ / baud;
+    volatile_write(port->divisor as *mut u32, CLK_FREQ / baud);
 }
 
 fn UARTHasByte(port: *UARTPort) -> bool {
-    (*(port->status as *u32) & UART_RX_READY) != 0
+    (volatile_read(port->status as *u32) & UART_RX_READY) != 0
 }
 
 fn UARTRead(port: *UARTPort) -> u8 {
-    *(port->data as *u8)
+    volatile_read(port->data as *u8)
 }
 
 fn UARTWrite(port: *UARTPort, value: u8) {
-    while (*(port->status as *u32) & UART_TX_BUSY) != 0 {}
-    *(port->data as *mut u8) = value;
+    while (volatile_read(port->status as *u32) & UART_TX_BUSY) != 0 {}
+    volatile_write(port->data as *mut u8, value);
 }
