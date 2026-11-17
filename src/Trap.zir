@@ -25,4 +25,6 @@ extern "C" {
     fn SetAddressSpace(page_table: u32, address_space: u32);
     fn FlushTLB(caches: u32);
     fn GetBadAddress() -> u32;
+    fn ReadCoreID() -> u32;
+    fn StartSecondaryCores(stack_tops: *u32);
 }

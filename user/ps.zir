@@ -17,9 +17,10 @@
 #[include "Common/System.zir", "Common/Format.zir" : *]
 
 const SYSTEM_LIST_PROCESSES: u32 = 28;
-const MAX_PROCESSES: u32 = 16;
+const MAX_PROCESSES: u32 = 32;
 const PROCESS_BRAM_STACK: u32 = 1;
 const PROCESS_CURRENT: u32 = 4;
+const PROCESS_THREAD: u32 = 8;
 
 struct ProcessRecord {
     pub id: u32,
@@ -31,7 +32,7 @@ struct ProcessRecord {
 }
 
 fn ListProcesses() -> Vector<ProcessRecord> {
-    let mut records: [ProcessRecord; 16];
+    let mut records: [ProcessRecord; 32];
     let mut count: u32 = 0;
     let mut result: u32 = 0;
 
@@ -59,6 +60,8 @@ fn StateName(record: &ProcessRecord) -> *i8 {
         4 => "joining",
         5 => "crashed",
         6 => "loading",
+        7 => "exiting",
+        8 => "blocked",
         _ => "unknown"
     }
 }
@@ -70,7 +73,7 @@ fn Main(args: &mut Vector<String>) -> i32 {
         let stack = if (record.flags & PROCESS_BRAM_STACK) != 0 { "bram" } else { "sdram" };
 
         WriteLine(PadRight(String::FromInteger(record.id), 5) + PadRight(StateName(record).ToString(), 10) + PadRight(String::FromInteger(record.ticks), 10) +
-            PadRight(stack.ToString(), 6) + Address(record.stack_bottom) + "  " + (&record.name[0] as *i8).ToString());
+            PadRight(stack.ToString(), 6) + Address(record.stack_bottom) + "  " + (&record.name[0] as *i8).ToString() + (if (record.flags & PROCESS_THREAD) != 0 { " (thread)" } else { "" }));
     }
 
     0

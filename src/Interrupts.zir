@@ -19,6 +19,7 @@
 
 const INTERRUPT_TIMER: u32 = 1;
 const INTERRUPT_UART: u32 = 2;
+const INTERRUPT_SOFTWARE: u32 = 4;
 
 enum TrapCause: u32 {
     InstructionFault = 0x00000001,
@@ -29,6 +30,7 @@ enum TrapCause: u32 {
     SystemCall = 0x00000008,
     Timer = 0x80000000,
     UART = 0x80000001,
+    Software = 0x80000002,
     Unknown = 0xFFFFFFFF
 }
 
@@ -70,19 +72,26 @@ enum SystemCall: u32 {
     DebugRead = 34,
     SetAnimation = 35,
     SetLEDs = 36,
+    ThreadCreate = 37,
+    ThreadExit = 38,
+    Yield = 39,
+    FutexWait = 40,
+    FutexWake = 41,
+    ProcessorCount = 42,
     Unknown = 0xFFFFFFFF
 }
 
 const TICK_CYCLES: u32 = CLK_FREQ / TICK_RATE;
 const USER_STRING_LIMIT: u32 = 4096;
 
-static mut next_tick: u32 = 0;
+static mut next_ticks: [u32; 8];
 
 fn InitializeInterrupts() {
+    let core = ReadCoreID();
     InitializeTraps();
-    next_tick = GetCycles() + TICK_CYCLES;
-    SetTimer(next_tick);
-    SetInterruptMask(INTERRUPT_TIMER | INTERRUPT_UART);
+    next_ticks[core as usize] = GetCycles() + TICK_CYCLES;
+    SetTimer(next_ticks[core as usize]);
+    SetInterruptMask(if core == 0 { INTERRUPT_TIMER | INTERRUPT_UART | INTERRUPT_SOFTWARE } else { INTERRUPT_TIMER | INTERRUPT_SOFTWARE });
     EnableInterrupts();
 }
 
@@ -114,8 +123,7 @@ fn WriteFault(cause: TrapCause, frame: *Frame) {
 }
 
 fn TerminateProcess(frame: *mut Frame) -> *mut Frame {
-    WakeJoiningProcesses(current_process, FILE_CRASHED, 0);
-    ReleaseProcess(current_process, false);
+    EndGroup(CurrentProcess(), FILE_CRASHED, 0, false);
     Schedule(frame)
 }
 
@@ -124,23 +132,18 @@ fn InterruptForeground(frame: *mut Frame) -> *mut Frame {
     let mut id: u32 = 1;
 
     while id < MAX_PROCESSES {
-        if (foreground & (1u32 << id)) != 0 && id != current_process {
-            Kill(id);
+        if (foreground & (1u32 << id)) != 0 && processes[id as usize].state != ProcessState::Free {
+            EndGroup(id, FILE_KILLED, 0, false);
         }
 
         id += 1;
-    }
-
-    if (foreground & (1u32 << current_process)) != 0 {
-        WakeJoiningProcesses(current_process, FILE_KILLED, 0);
-        ReleaseProcess(current_process, false);
     }
 
     Schedule(frame)
 }
 
 fn RejectCall(frame: *mut Frame) -> *mut Frame {
-    Write(processes[current_process as usize].name);
+    Write(processes[CurrentProcess() as usize].name);
     Write(" crashed: invalid pointer passed to system call ");
     WriteInteger(frame->a7);
     WriteLine(".");
@@ -148,11 +151,11 @@ fn RejectCall(frame: *mut Frame) -> *mut Frame {
 }
 
 fn UserRoot() -> u32 {
-    processes[current_process as usize].page_table
+    processes[CurrentProcess() as usize].page_table
 }
 
 fn UserBuffer(address: u32, length: u32, write: bool) -> bool {
-    !IsUserProcess(current_process) || IsUserRange(UserRoot(), address, length, write)
+    !IsUserProcess(CurrentProcess()) || IsUserRange(UserRoot(), address, length, write)
 }
 
 fn UserBufferOrNull(address: u32, length: u32, write: bool) -> bool {
@@ -164,7 +167,7 @@ fn UserWord(address: u32) -> bool {
 }
 
 fn UserString(address: u32) -> bool {
-    !IsUserProcess(current_process) || IsUserString(UserRoot(), address, USER_STRING_LIMIT)
+    !IsUserProcess(CurrentProcess()) || IsUserString(UserRoot(), address, USER_STRING_LIMIT)
 }
 
 fn UserStringOrNull(address: u32) -> bool {
@@ -199,19 +202,37 @@ fn ValidateCall(call: SystemCall, frame: *Frame) -> bool {
         SystemCall::DebugPeek => UserWord(a1),
         SystemCall::DebugRead => UserBuffer(a1, a2, true),
         SystemCall::Move | SystemCall::Copy => UserString(a0) && UserString(a1),
+        SystemCall::FutexWait => (a0 & 3) == 0 && UserBuffer(a0, 4, false),
         _ => true
     }
 }
 
 @nomangle
 fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
+    AcquireKernel();
+    let current = CurrentProcess();
+
+    if processes[current as usize].kill_pending {
+        ReleaseMember(current);
+        return Schedule(frame);
+    }
+
     match cause {
         TrapCause::Timer => {
-            next_tick += TICK_CYCLES;
-            SetTimer(next_tick);
-            ticks += 1;
-            processes[current_process as usize].ticks += 1;
-            WakeSleepingProcesses();
+            let core = ReadCoreID();
+            next_ticks[core as usize] += TICK_CYCLES;
+            SetTimer(next_ticks[core as usize]);
+            processes[current as usize].ticks += 1;
+
+            if core == 0 {
+                ticks += 1;
+                WakeSleepingProcesses();
+            }
+
+            return Schedule(frame);
+        },
+        TrapCause::Software => {
+            ClearInterrupt();
             return Schedule(frame);
         },
         TrapCause::UART => {
@@ -235,7 +256,7 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                 loop {}
             }
 
-            Write(processes[current_process as usize].name);
+            Write(processes[CurrentProcess() as usize].name);
             Write(" crashed: ");
             WriteFault(cause, frame);
             return TerminateProcess(frame);
@@ -249,22 +270,21 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
 
             match call {
                 SystemCall::Exit => {
-                    WakeJoiningProcesses(current_process, FILE_OK, frame->a0 as i32);
-                    ReleaseProcess(current_process, true);
+                    EndGroup(CurrentProcess(), FILE_OK, frame->a0 as i32, true);
                     return Schedule(frame);
                 },
                 SystemCall::Allocate => {
-                    frame->a0 = AllocateUserMemory(current_process, frame->a0);
+                    frame->a0 = AllocateUserMemory(CurrentProcess(), frame->a0);
                 },
                 SystemCall::Free => {
-                    FreeUserMemory(current_process, frame->a0);
+                    FreeUserMemory(CurrentProcess(), frame->a0);
                 },
                 SystemCall::ConsoleRead => {
                     if frame->a0 == 0 || frame->a1 == 0 {
                         frame->a0 = 0;
                     } else if !HasCharacter() {
                         frame->epc -= 4;
-                        processes[current_process as usize].state = ProcessState::Waiting;
+                        processes[CurrentProcess() as usize].state = ProcessState::Waiting;
                         return Schedule(frame);
                     } else {
                         (frame->a0 as *mut i8)[0] = ReadCharacter();
@@ -291,7 +311,7 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                 },
                 SystemCall::Sleep => {
                     let milliseconds = frame->a0;
-                    let process = &mut processes[current_process as usize];
+                    let process = &mut processes[CurrentProcess() as usize];
                     process.wake_tick = ticks + (milliseconds + MILLISECONDS_PER_TICK - 1) / MILLISECONDS_PER_TICK;
                     process.state = ProcessState::Sleeping;
                     return Schedule(frame);
@@ -343,7 +363,7 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                     frame->a0 = ExecuteFile(frame->a0 as *i8, frame->a1 as *i8, &mut child);
 
                     if frame->a0 == FILE_OK {
-                        let process = &mut processes[current_process as usize];
+                        let process = &mut processes[CurrentProcess() as usize];
                         process.child = child;
                         process.child_status = frame->a2 as *mut i32;
                         process.state = ProcessState::Joining;
@@ -383,6 +403,32 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                 SystemCall::SetLEDs => {
                     SetLEDs(frame->a0 as i8);
                     frame->a0 = FILE_OK;
+                },
+                SystemCall::ThreadCreate => {
+                    frame->a0 = CreateThread(frame->a0, frame->a1, frame->a2);
+                },
+                SystemCall::ThreadExit => {
+                    if IsThread(CurrentProcess()) {
+                        ReleaseMember(CurrentProcess());
+                    } else {
+                        EndGroup(CurrentProcess(), FILE_OK, frame->a0 as i32, true);
+                    }
+
+                    return Schedule(frame);
+                },
+                SystemCall::Yield => {
+                    return Schedule(frame);
+                },
+                SystemCall::FutexWait => {
+                    if WaitOnAddress(frame, frame->a0, frame->a1, frame->a2) {
+                        return Schedule(frame);
+                    }
+                },
+                SystemCall::FutexWake => {
+                    frame->a0 = WakeAddress(frame->a0, frame->a1);
+                },
+                SystemCall::ProcessorCount => {
+                    frame->a0 = OnlineCores();
                 },
                 _ => {
                     frame->a0 = 0xFFFFFFFF;

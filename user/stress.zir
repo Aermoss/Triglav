@@ -1,0 +1,199 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/thrd", "std/atom", "std/time" : *]
+
+const MAX_WORKERS: u32 = 8;
+const BUFFER_WORDS: u32 = 32768;
+const CHAIN_LENGTH: u32 = 512;
+
+class Worker {
+    pub id: u32,
+    pub rounds: u32,
+    pub errors: u32,
+    pub reference: u32,
+    pub buffer: *mut u32;
+
+    Worker(&mut this) {
+        this.id = 0;
+        this.rounds = 0;
+        this.errors = 0;
+        this.reference = 0;
+        this.buffer = null;
+    }
+}
+
+static mut workers: [Worker; 8];
+static mut stop: u32 = 0;
+static mut mode: u32 = 0;
+
+const MODE_ALL: u32 = 0;
+const MODE_CPU: u32 = 1;
+const MODE_MEMORY: u32 = 2;
+static mut shared_counter: u32 = 0;
+
+fn Chain(seed: u32) -> u32 {
+    let mut x = seed;
+    let mut y: u32 = 0x9E3779B9;
+
+    for i in 0..CHAIN_LENGTH {
+        x = x * 1664525 + 1013904223;
+        y ^= (x >> 7) | (x << 25);
+        y = y + (x / ((y & 0xFFFF) | 1)) + (x % 97) + i;
+    }
+
+    x ^ y
+}
+
+fn Sweep(buffer: *mut u32, pattern: u32) -> u32 {
+    let mut errors: u32 = 0;
+    let mut i: u32 = 0;
+
+    while i < BUFFER_WORDS {
+        buffer[i as usize] = pattern ^ (i * 2654435761);
+        i += 1;
+    }
+
+    i = 0;
+
+    while i < BUFFER_WORDS {
+        let index = (i * 4099) % BUFFER_WORDS;
+
+        if buffer[index as usize] != pattern ^ (index * 2654435761) {
+            errors += 1;
+        }
+
+        i += 1;
+    }
+
+    errors
+}
+
+fn Work(argument: *mut void) {
+    let worker = &mut workers[argument as usize] as *mut Worker;
+    worker->buffer = new u32[BUFFER_WORDS as usize];
+    worker->reference = Chain(worker->id + 1);
+
+    while volatile_read(&stop as *u32) == 0 {
+        if mode != MODE_MEMORY {
+            for _ in 0..(if mode == MODE_CPU { 4 } else { 1 }) {
+                if Chain(worker->id + 1) != worker->reference {
+                    AtomicIncrement32(&mut worker->errors);
+                }
+            }
+        }
+
+        if mode != MODE_CPU {
+            let errors = Sweep(worker->buffer, worker->rounds * 0x01000193 + worker->id);
+
+            if errors != 0 {
+                AtomicFetchAdd32(&mut worker->errors, errors);
+            }
+        }
+
+        if mode == MODE_ALL {
+            for _ in 0..64 {
+                AtomicIncrement32(&mut shared_counter);
+            }
+        }
+
+        AtomicIncrement32(&mut worker->rounds);
+    }
+
+    delete[] worker->buffer;
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    let mut seconds: u32 = 0;
+    let mut count = Thread::HardwareConcurrency() as u32;
+    let mut numbers: u32 = 0;
+
+    for i in 1..args.Length() {
+        if args[i] == "cpu" {
+            mode = MODE_CPU;
+        } else if args[i] == "mem" {
+            mode = MODE_MEMORY;
+        } else if args[i] == "all" {
+            mode = MODE_ALL;
+        } else {
+            let value = args[i].ToUnsignedInteger().UnwrapOr(0) as u32;
+            if numbers == 0 { seconds = value; } else if value != 0 { count = value; }
+            numbers += 1;
+        }
+    }
+
+    if count > MAX_WORKERS { count = MAX_WORKERS; }
+    if count == 0 { count = 1; }
+
+    WriteLine("Usage: stress [all|cpu|mem] [seconds] [threads]");
+    WriteLine("Stressing with " + String::FromInteger(count) + " threads" + (if seconds == 0 { ", press Ctrl+C to stop.".ToString() } else { " for " + String::FromInteger(seconds) + " seconds." }));
+
+    if mode == MODE_CPU {
+        WriteLine("Each round runs four multiply/divide chains that stay in the caches.");
+    } else if mode == MODE_MEMORY {
+        WriteLine("Each round sweeps a 128 KB buffer, which does not fit in the caches.");
+    } else {
+        WriteLine("Each round runs a multiply/divide chain, sweeps a 128 KB buffer and does 64 atomic adds.");
+    }
+
+    for i in 0..count {
+        workers[i as usize].id = i;
+    }
+
+    let mut threads = Vector<*mut Thread>();
+
+    for i in 1..count {
+        threads.PushBack(new Thread(Work, i as usize as *mut void, 64 * 1024));
+    }
+
+    let mut main_thread = Thread(Work, 0 as usize as *mut void, 64 * 1024);
+    let start = Instant::Now();
+    let mut previous: u32 = 0;
+    let mut elapsed: u32 = 0;
+
+    while seconds == 0 || elapsed < seconds {
+        main_thread.Sleep(1, 0);
+        elapsed += 1;
+        let mut total: u32 = 0;
+        let mut errors: u32 = 0;
+        let mut line = String::FromInteger(elapsed) + "s:";
+
+        for i in 0..count {
+            let rounds = volatile_read(&workers[i as usize].rounds as *u32);
+            total += rounds;
+            errors += volatile_read(&workers[i as usize].errors as *u32);
+            line += " " + String::FromInteger(rounds);
+        }
+
+        line += " | " + String::FromInteger(total - previous) + " rounds/s, errors " + String::FromInteger(errors);
+        WriteLine(line);
+        previous = total;
+    }
+
+    volatile_write(&mut stop as *mut u32, 1);
+    main_thread.Join();
+
+    for thread in threads {
+        thread->Join();
+        delete thread;
+    }
+
+    let mut errors: u32 = 0;
+    for i in 0..count { errors += workers[i as usize].errors; }
+
+    WriteLine("Finished after " + String::FromInteger(start.ElapsedMilliseconds()) + " ms, shared counter " + String::FromInteger(shared_counter) + ", errors " + String::FromInteger(errors) + ".");
+    if errors == 0 { 0 } else { 1 }
+}

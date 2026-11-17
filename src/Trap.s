@@ -10,8 +10,12 @@
 .global SetAddressSpace
 .global FlushTLB
 .global GetBadAddress
+.global ReadCoreID
+.global StartSecondaryCores
 .extern HandleTrap
 .extern Schedule
+.extern PrepareReturn
+.extern SecondaryMain
 
 TrapEntry:
     csrrw sp, scratch, sp
@@ -70,6 +74,8 @@ TrapSave:
     mv sp, a0
 
 RestoreContext:
+    mv a0, sp
+    bl ra, PrepareReturn
     lw t0, 0(sp)
     csrw epc, t0
     lw t0, 128(sp)
@@ -190,3 +196,34 @@ FlushTLB:
 GetBadAddress:
     csrr a0, badaddr
     br ra
+
+ReadCoreID:
+    csrr a0, coreid
+    br ra
+
+StartSecondaryCores:
+    la t0, secondary_stacks
+    sw a0, 0(t0)
+    la t0, SecondaryEntry
+    li t1, 0xFFA0
+    sw t0, 0(t1)
+    br ra
+
+SecondaryEntry:
+    la t0, secondary_stacks
+    lw t0, 0(t0)
+    csrr t1, coreid
+    li t2, 8
+    bgeu t1, t2, SecondaryPark
+    slli t1, t1, 2
+    add t0, t0, t1
+    lw sp, 0(t0)
+    beq sp, zero, SecondaryPark
+    bl ra, SecondaryMain
+
+SecondaryPark:
+    hlt
+
+.data
+secondary_stacks:
+    .word 0

@@ -30,6 +30,12 @@ const MS_COUNTER: u32 = 0xFFEC;
 const CYCLE_COUNTER: u32 = 0xFFE8;
 const INSTRUCTION_COUNTER: u32 = 0xFFE4;
 const TIMER_COMPARE: u32 = 0xFFDC;
+const IPI_SEND: u32 = 0xFFA8;
+const IPI_CLEAR: u32 = 0xFFA4;
+const CORE_CONTROL: u32 = 0xFFA0;
+const SPINLOCK_BASE: u32 = 0xFF80;
+
+const MAX_CORES: u32 = 8;
 
 static mut console_uart: UARTPort;
 
@@ -75,4 +81,25 @@ fn GetInstructions() -> u32 {
 
 fn SetTimer(cycles: u32) {
     volatile_write(TIMER_COMPARE as *mut u32, cycles);
+}
+
+fn CoreCount() -> u32 {
+    let count = volatile_read(CORE_CONTROL as *u32);
+    if count == 0 { 1 } else if count > MAX_CORES { MAX_CORES } else { count }
+}
+
+fn SendInterrupt(cores: u32) {
+    volatile_write(IPI_SEND as *mut u32, cores);
+}
+
+fn ClearInterrupt() {
+    volatile_write(IPI_CLEAR as *mut u32, 0);
+}
+
+fn TryAcquireSpinlock(index: u32) -> bool {
+    volatile_read((SPINLOCK_BASE + index * 4) as *u32) != 0
+}
+
+fn ReleaseSpinlock(index: u32) {
+    volatile_write((SPINLOCK_BASE + index * 4) as *mut u32, 0);
 }

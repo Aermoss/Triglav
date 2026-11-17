@@ -1,0 +1,182 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/thrd", "std/atom", "std/time" : *]
+
+const ROUNDS: u32 = 400;
+const WORKERS: u32 = 3;
+
+class Shared {
+    pub mutex: Mutex,
+    pub condition: ConditionVariable,
+    pub counter: u32,
+    pub atomic_counter: u32,
+    pub turn: u32,
+    pub handoffs: u32,
+    pub errors: u32,
+    pub stop: u32;
+
+    Shared(&mut this) {
+        this.counter = 0;
+        this.atomic_counter = 0;
+        this.turn = 0;
+        this.handoffs = 0;
+        this.errors = 0;
+        this.stop = 0;
+    }
+}
+
+static mut shared: *mut Shared = null;
+
+fn Allocations(id: u32) {
+    let mut strings = Vector<String>();
+
+    for i in 0..ROUNDS {
+        strings.PushBack(String::FromInteger(i * 7 + id));
+
+        if i % 4 == 3 {
+            let big = new u8[20000];
+            big[0] = id as u8;
+            big[19999] = i as u8;
+
+            if big[0] != id as u8 || big[19999] != i as u8 {
+                AtomicIncrement32(&mut shared->errors);
+            }
+
+            delete[] big;
+        }
+    }
+
+    for i in 0..ROUNDS {
+        if strings[i as usize] != String::FromInteger(i * 7 + id) {
+            AtomicIncrement32(&mut shared->errors);
+        }
+    }
+}
+
+fn Worker(argument: *mut void) {
+    let id = argument as usize as u32;
+    Allocations(id);
+
+    for _ in 0..ROUNDS {
+        shared->mutex.Lock();
+        shared->counter += 1;
+        shared->mutex.Unlock();
+        AtomicIncrement32(&mut shared->atomic_counter);
+    }
+}
+
+fn PingPong(argument: *mut void) {
+    let me = argument as usize as u32;
+
+    for _ in 0..50 {
+        shared->mutex.Lock();
+
+        while shared->turn != me {
+            shared->condition.Wait(&mut shared->mutex);
+        }
+
+        shared->handoffs += 1;
+        shared->turn = 1 - me;
+        shared->condition.Broadcast();
+        shared->mutex.Unlock();
+    }
+}
+
+fn Spin(argument: *mut void) {
+    let mut count: u32 = 0;
+
+    while volatile_read(&shared->stop as *u32) == 0 {
+        count += 1;
+    }
+}
+
+fn Crash(argument: *mut void) {
+    Thread::Yield();
+    volatile_write(0x10 as *mut u32, 1);
+}
+
+fn Check(name: *i8, actual: u32, expected: u32) -> bool {
+    if actual == expected {
+        WriteLine(name.ToString() + ": ok");
+        return true;
+    }
+
+    WriteLine(name.ToString() + ": FAIL got " + String::FromInteger(actual) + " expected " + String::FromInteger(expected));
+    false
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    shared = new Shared();
+    let mode = if args.Length() > 1 { args[1] } else { String() };
+
+    if mode == "spin" {
+        WriteLine("Spinning on all cores, press Ctrl+C to stop.");
+        let mut first = Thread(Spin, null);
+        let mut second = Thread(Spin, null);
+        Spin(null);
+        first.Join();
+        second.Join();
+        return 0;
+    }
+
+    if mode == "crash" {
+        WriteLine("Crashing a thread while another one spins.");
+        let mut spinner = Thread(Spin, null);
+        let mut crasher = Thread(Crash, null);
+        Spin(null);
+        spinner.Join();
+        crasher.Join();
+        return 0;
+    }
+
+    WriteLine("Processors: " + String::FromInteger(Thread::HardwareConcurrency() as u32));
+    let start = Instant::Now();
+    let mut workers = Vector<*mut Thread>();
+
+    for i in 0..WORKERS {
+        workers.PushBack(new Thread(Worker, (i + 1) as usize as *mut void));
+    }
+
+    Worker(null);
+
+    for worker in workers {
+        worker->Join();
+        delete worker;
+    }
+
+    let mut ok = true;
+    ok = Check("mutex counter", shared->counter, ROUNDS * (WORKERS + 1)) && ok;
+    ok = Check("atomic counter", shared->atomic_counter, ROUNDS * (WORKERS + 1)) && ok;
+    ok = Check("allocation errors", shared->errors, 0) && ok;
+
+    let mut ping = Thread(PingPong, 0 as usize as *mut void);
+    PingPong(1 as usize as *mut void);
+    ping.Join();
+    ok = Check("condition handoffs", shared->handoffs, 100) && ok;
+
+    shared->mutex.Lock();
+    let timed = shared->condition.Wait(&mut shared->mutex, 50);
+    shared->mutex.Unlock();
+    ok = Check("timed wait expired", timed as u32, 0) && ok;
+
+    let mut detached = Thread(Worker, 9 as usize as *mut void);
+    detached.Detach();
+
+    WriteLine("Elapsed: " + String::FromInteger(start.ElapsedMilliseconds()) + " ms");
+    WriteLine(if ok { "ALL PASS" } else { "FAILED" });
+    if ok { 0 } else { 1 }
+}

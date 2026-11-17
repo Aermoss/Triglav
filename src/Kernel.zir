@@ -46,8 +46,73 @@ fn RunInit(argument: u32) {
     }
 }
 
+fn IdleLoop() {
+    loop {
+        DisableInterrupts();
+        ReleaseKernel();
+        WaitForInterrupt();
+        AcquireKernel();
+        EnableInterrupts();
+    }
+}
+
+static mut secondary_stacks: [u32; 8];
+
+fn IdleName(core: u32) -> *i8 {
+    match core {
+        1 => "idle1",
+        2 => "idle2",
+        3 => "idle3",
+        4 => "idle4",
+        5 => "idle5",
+        6 => "idle6",
+        _ => "idle7"
+    }
+}
+
+fn StartCores() {
+    let count = CoreCount();
+
+    if count < 2 {
+        return;
+    }
+
+    let mut core: u32 = 1;
+
+    while core < count {
+        let stack = Allocate(KERNEL_STACK_SIZE) as u32;
+
+        if stack == 0 {
+            Write("Cannot allocate a stack for core ");
+            WriteInteger(core);
+            WriteLine(".");
+            break;
+        }
+
+        InitializeIdle(core, IdleName(core), stack, KERNEL_STACK_SIZE);
+        secondary_stacks[core as usize] = stack + KERNEL_STACK_SIZE;
+        core += 1;
+    }
+
+    StartSecondaryCores(&secondary_stacks[0] as *u32);
+}
+
+@nomangle
+fn SecondaryMain() {
+    AcquireKernel();
+    let core = ReadCoreID();
+    cores_online[core as usize] = true;
+    SetCurrentProcess(core);
+    InitializeInterrupts();
+    Write("Core ");
+    WriteInteger(core);
+    WriteLine(" started.");
+    IdleLoop();
+}
+
 @nomangle
 fn Main(image_end: u32) {
+    AcquireKernel();
     InitializeUARTs();
     SetBaudRate(BAUD_RATE);
     SetLEDs(0x3F);
@@ -68,10 +133,8 @@ fn Main(image_end: u32) {
         WriteLine("No SD card with a FAT32 or exFAT file system was found, so there is no shell to start.");
     }
 
+    StartCores();
     InitializeInterrupts();
     Yield();
-
-    loop {
-        WaitForInterrupt();
-    }
+    IdleLoop();
 }

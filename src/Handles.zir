@@ -75,7 +75,7 @@ fn ReserveHandle() -> u32 {
         let handle = &mut handles[slot as usize];
         handle.used = true;
         handle.dirty = false;
-        handle.owner = current_process;
+        handle.owner = GroupOf(CurrentProcess());
         handle.mode = OPEN_READ;
         handle.position = 0;
         handle.data = null;
@@ -99,7 +99,7 @@ fn ReleaseHandle(slot: u32) {
 }
 
 fn IsOwnedHandle(slot: u32) -> bool {
-    slot < MAX_HANDLES && handles[slot as usize].used && handles[slot as usize].owner == current_process
+    slot < MAX_HANDLES && handles[slot as usize].used && handles[slot as usize].owner == GroupOf(CurrentProcess())
 }
 
 fn IsOpenForWriting(path: *i8) -> bool {

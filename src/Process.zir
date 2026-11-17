@@ -21,8 +21,11 @@ type ProcessEntry = fn(u32);
 const TICK_RATE: u32 = 100;
 const MILLISECONDS_PER_TICK: u32 = 1000 / TICK_RATE;
 
-const MAX_PROCESSES: u32 = 16;
+const MAX_PROCESSES: u32 = 32;
 const NO_PROCESS: u32 = 0xFFFFFFFF;
+const NO_CORE: u32 = 0xFFFFFFFF;
+const FIRST_PROCESS: u32 = MAX_CORES;
+const KERNEL_LOCK: u32 = 0;
 
 const STACK_SIZE: u32 = 1024;
 const BRAM_STACKS: u32 = 12;
@@ -30,9 +33,15 @@ const STACKS_END: u32 = 0x00004000;
 const STACKS_START: u32 = STACKS_END - BRAM_STACKS * STACK_SIZE;
 const STACK_CANARY: u32 = 0x5AFE57AC;
 const KERNEL_STACK_SIZE: u32 = 8192;
+const THREAD_STACK_SIZE: u32 = 64 * 1024;
+const THREAD_STACK_LIMIT: u32 = 4 * 1024 * 1024;
 
 const STATUS_PREVIOUS_ENABLE: u32 = 2;
 const STATUS_PREVIOUS_USER: u32 = 4;
+
+const FUTEX_WOKEN: u32 = 0;
+const FUTEX_TIMED_OUT: u32 = 1;
+const FUTEX_MISMATCH: u32 = 2;
 
 struct Frame {
     pub epc: u32,
@@ -44,7 +53,7 @@ struct Frame {
 }
 
 enum ProcessState: u32 {
-    Free, Ready, Sleeping, Waiting, Joining, Crashed, Loading
+    Free, Ready, Sleeping, Waiting, Joining, Crashed, Loading, Exiting, Blocked
 }
 
 struct Process {
@@ -61,11 +70,137 @@ struct Process {
     pub child: u32,
     pub child_status: *mut i32,
     pub page_table: u32,
-    pub heap_hint: u32
+    pub heap_hint: u32,
+    pub core: u32,
+    pub last_core: u32,
+    pub kill_pending: bool,
+    pub group: u32,
+    pub members: u32,
+    pub ending: bool,
+    pub exit_error: u32,
+    pub exit_status: i32,
+    pub exit_save: bool,
+    pub user_stack: u32,
+    pub futex_address: u32,
+    pub futex_timed: bool
 }
 
-static mut processes: [Process; 16];
-static mut current_process: u32 = 0;
+static mut processes: [Process; 32];
+static mut current_processes: [u32; 8];
+static mut kernel_holders: [bool; 8];
+static mut kernel_waiters: [bool; 8];
+static mut cores_online: [bool; 8];
+static mut tlb_requests: [u32; 8];
+
+fn CurrentProcess() -> u32 {
+    current_processes[ReadCoreID() as usize]
+}
+
+fn SetCurrentProcess(id: u32) {
+    current_processes[ReadCoreID() as usize] = id;
+}
+
+fn IsIdle(id: u32) -> bool {
+    id < FIRST_PROCESS
+}
+
+fn GroupOf(id: u32) -> u32 {
+    processes[id as usize].group
+}
+
+fn IsThread(id: u32) -> bool {
+    processes[id as usize].group != id
+}
+
+fn ServiceShootdown(core: usize) {
+    if volatile_read(&tlb_requests[core] as *u32) != 0 {
+        FlushTLB(0);
+        volatile_write(&mut tlb_requests[core] as *mut u32, 0);
+    }
+}
+
+fn ShootdownTLB() {
+    let core = ReadCoreID();
+    let mut other: u32 = 0;
+
+    while other < MAX_CORES {
+        if other != core && cores_online[other as usize] {
+            volatile_write(&mut tlb_requests[other as usize] as *mut u32, 1);
+            SendInterrupt(1u32 << other);
+
+            while volatile_read(&tlb_requests[other as usize] as *u32) != 0 {}
+        }
+
+        other += 1;
+    }
+}
+
+fn OnlineCores() -> u32 {
+    let mut count: u32 = 0;
+    let mut core: u32 = 0;
+
+    while core < MAX_CORES {
+        if cores_online[core as usize] { count += 1; }
+        core += 1;
+    }
+
+    count
+}
+
+fn AcquireKernel() {
+    let core = ReadCoreID() as usize;
+    if kernel_holders[core] { return; }
+    kernel_waiters[core] = true;
+
+    while !TryAcquireSpinlock(KERNEL_LOCK) {
+        ServiceShootdown(core);
+    }
+
+    kernel_waiters[core] = false;
+    kernel_holders[core] = true;
+}
+
+fn ReleaseKernel() {
+    let core = ReadCoreID() as usize;
+    if !kernel_holders[core] { return; }
+    kernel_holders[core] = false;
+    ReleaseSpinlock(KERNEL_LOCK);
+}
+
+fn OtherCoreWaiting() -> bool {
+    let core = ReadCoreID();
+    let mut other: u32 = 0;
+
+    while other < MAX_CORES {
+        if other != core && kernel_waiters[other as usize] {
+            return true;
+        }
+
+        other += 1;
+    }
+
+    false
+}
+
+fn WakeIdleCores() {
+    let core = ReadCoreID();
+    let mut other: u32 = 0;
+
+    while other < MAX_CORES {
+        if other != core && current_processes[other as usize] == other {
+            SendInterrupt(1u32 << other);
+        }
+
+        other += 1;
+    }
+}
+
+@nomangle
+fn PrepareReturn(frame: *Frame) {
+    if (frame->status & STATUS_PREVIOUS_USER) != 0 {
+        ReleaseKernel();
+    }
+}
 static mut ticks: u32 = 0;
 
 fn IsStackInBRAM(id: u32) -> bool {
@@ -91,7 +226,28 @@ fn ReleaseStack(id: u32) {
     }
 }
 
+fn ReleaseThread(id: u32) {
+    let leader = GroupOf(id);
+    let process = &mut processes[id as usize];
+
+    if process.user_stack != 0 {
+        FreeUserMemory(id, process.user_stack);
+        process.user_stack = 0;
+    }
+
+    ReleaseStack(id);
+    process.page_table = 0;
+    process.group = id;
+    process.state = ProcessState::Free;
+    processes[leader as usize].members -= 1;
+}
+
 fn ReleaseProcess(id: u32, save: bool) {
+    if IsThread(id) {
+        ReleaseThread(id);
+        return;
+    }
+
     CloseProcessFiles(id, save);
     FreeProcessAllocations(id);
     ReleaseStack(id);
@@ -101,16 +257,88 @@ fn ReleaseProcess(id: u32, save: bool) {
         FlushTLB(1);
     }
 
+    processes[id as usize].ending = false;
+    processes[id as usize].members = 0;
     processes[id as usize].state = ProcessState::Free;
 }
 
+fn FinishGroup(leader: u32) {
+    let (error, status, save) = (processes[leader as usize].exit_error, processes[leader as usize].exit_status, processes[leader as usize].exit_save);
+    WakeJoiningProcesses(leader, error, status);
+    ReleaseProcess(leader, save);
+}
+
+fn ReleaseMember(id: u32) {
+    let leader = GroupOf(id);
+    processes[id as usize].kill_pending = false;
+
+    if id != leader {
+        ReleaseThread(id);
+    } else if processes[leader as usize].state != ProcessState::Exiting {
+        processes[leader as usize].state = ProcessState::Exiting;
+        processes[leader as usize].members -= 1;
+    }
+
+    if processes[leader as usize].ending && processes[leader as usize].members == 0 {
+        FinishGroup(leader);
+    }
+}
+
+fn RemoveMember(id: u32) {
+    let process = &mut processes[id as usize];
+
+    if process.kill_pending {
+        return;
+    }
+
+    if id != CurrentProcess() && process.core != NO_CORE {
+        process.kill_pending = true;
+        SendInterrupt(1u32 << process.core);
+    } else {
+        ReleaseMember(id);
+    }
+}
+
+fn EndGroup(id: u32, error: u32, status: i32, save: bool) {
+    let leader = GroupOf(id);
+    let group = &mut processes[leader as usize];
+
+    if !group.ending {
+        group.ending = true;
+        group.exit_error = error;
+        group.exit_status = status;
+        group.exit_save = save;
+    }
+
+    let mut member = FIRST_PROCESS;
+
+    while member < MAX_PROCESSES {
+        if member != leader && processes[member as usize].state != ProcessState::Free && processes[member as usize].group == leader {
+            RemoveMember(member);
+        }
+
+        member += 1;
+    }
+
+    if processes[leader as usize].state != ProcessState::Exiting {
+        RemoveMember(leader);
+    }
+}
+
 fn ActivateProcess(id: u32) {
-    let process = &processes[id as usize];
+    let process = &mut processes[id as usize];
+    let core = ReadCoreID();
+    process.core = core;
+
+    if process.last_core != core {
+        process.last_core = core;
+        FlushTLB(1);
+    }
 
     if process.page_table != 0 {
-        SetAddressSpace(process.page_table | PTBASE_VALID, id);
+        SetAddressSpace(process.page_table | PTBASE_VALID, process.group);
     } else {
-        SetAddressSpace(0, id);
+        SetAddressSpace(0, process.group);
     }
 }
 
@@ -119,10 +347,11 @@ fn IsUserProcess(id: u32) -> bool {
 }
 
 fn AllocateUserMemory(id: u32, size: u32) -> u32 {
-    let process = &mut processes[id as usize];
+    let leader = GroupOf(id);
+    let process = &mut processes[leader as usize];
 
     if process.page_table == 0 {
-        return AllocateForProcess(size, id) as u32;
+        return AllocateForProcess(size, leader) as u32;
     }
 
     if size == 0 || size > USER_HEAP_END - USER_HEAP_START {
@@ -132,7 +361,7 @@ fn AllocateUserMemory(id: u32, size: u32) -> u32 {
     let pages = (size + PAGE_MASK) / PAGE_SIZE;
     let address = FindFreeRange(process.page_table, process.heap_hint, pages);
 
-    if address == 0 || !MapRange(id, process.page_table, address, size, PTE_WRITE) {
+    if address == 0 || !MapRange(leader, process.page_table, address, size, PTE_WRITE) {
         return 0;
     }
 
@@ -141,10 +370,11 @@ fn AllocateUserMemory(id: u32, size: u32) -> u32 {
 }
 
 fn FreeUserMemory(id: u32, address: u32) -> bool {
-    let root = processes[id as usize].page_table;
+    let leader = GroupOf(id);
+    let root = processes[leader as usize].page_table;
 
     if root == 0 {
-        return FreeForProcess(address as *mut u8, id);
+        return FreeForProcess(address as *mut u8, leader);
     }
 
     let pages = AllocationPages(root, address);
@@ -153,8 +383,90 @@ fn FreeUserMemory(id: u32, address: u32) -> bool {
         return false;
     }
 
-    UnmapPages(id, root, address, pages);
+    UnmapPages(leader, root, address, pages);
+
+    if processes[leader as usize].members > 1 {
+        ShootdownTLB();
+    }
+
     true
+}
+
+fn CreateThread(entry: u32, argument: u32, requested: u32) -> u32 {
+    let current = CurrentProcess();
+    let leader = GroupOf(current);
+
+    if !IsUserProcess(current) || processes[leader as usize].ending || requested > THREAD_STACK_LIMIT {
+        return NO_PROCESS;
+    }
+
+    let size = if requested == 0 { THREAD_STACK_SIZE } else { (requested + PAGE_MASK) & !PAGE_MASK };
+    let stack = AllocateUserMemory(current, size);
+
+    if stack == 0 {
+        return NO_PROCESS;
+    }
+
+    let id = SpawnWithStack(processes[leader as usize].name, entry as *void as ProcessEntry, argument, KERNEL_STACK_SIZE);
+
+    if id == NO_PROCESS {
+        FreeUserMemory(current, stack);
+        return NO_PROCESS;
+    }
+
+    let process = &mut processes[id as usize];
+    process.group = leader;
+    process.members = 0;
+    process.page_table = processes[leader as usize].page_table;
+    process.user_stack = stack;
+    process.frame->ra = 0;
+    process.frame->sp = stack + size;
+    process.frame->status = STATUS_PREVIOUS_ENABLE | STATUS_PREVIOUS_USER;
+    processes[leader as usize].members += 1;
+    id
+}
+
+fn WaitOnAddress(frame: *mut Frame, address: u32, expected: u32, milliseconds: u32) -> bool {
+    if volatile_read(address as *u32) != expected {
+        frame->a0 = FUTEX_MISMATCH;
+        return false;
+    }
+
+    let process = &mut processes[CurrentProcess() as usize];
+    process.futex_address = address;
+    process.futex_timed = milliseconds != 0xFFFFFFFF;
+
+    if process.futex_timed {
+        process.wake_tick = ticks + (milliseconds + MILLISECONDS_PER_TICK - 1) / MILLISECONDS_PER_TICK;
+    }
+
+    frame->a0 = FUTEX_TIMED_OUT;
+    process.state = ProcessState::Blocked;
+    true
+}
+
+fn WakeAddress(address: u32, count: u32) -> u32 {
+    let leader = GroupOf(CurrentProcess());
+    let mut woken: u32 = 0;
+    let mut id = FIRST_PROCESS;
+
+    while id < MAX_PROCESSES && woken < count {
+        let process = &mut processes[id as usize];
+
+        if process.state == ProcessState::Blocked && process.group == leader && process.futex_address == address {
+            process.frame->a0 = FUTEX_WOKEN;
+            process.state = ProcessState::Ready;
+            woken += 1;
+        }
+
+        id += 1;
+    }
+
+    if woken != 0 {
+        WakeIdleCores();
+    }
+
+    woken
 }
 
 fn SetStack(id: u32, bottom: u32, size: u32) {
@@ -165,10 +477,35 @@ fn SetStack(id: u32, bottom: u32, size: u32) {
 }
 
 fn InitializeProcesses() {
-    current_process = 0;
+    for i in 0..MAX_PROCESSES {
+        processes[i as usize].core = NO_CORE;
+        processes[i as usize].last_core = NO_CORE;
+    }
+
+    for i in 0..MAX_PROCESSES {
+        processes[i as usize].group = i;
+    }
+
+    cores_online[0] = true;
+    SetCurrentProcess(0);
     processes[0].state = ProcessState::Ready;
+    processes[0].members = 1;
     processes[0].name = "idle";
+    processes[0].core = 0;
+    processes[0].last_core = 0;
     SetStack(0, AllocateStack(0, STACK_SIZE), STACK_SIZE);
+}
+
+fn InitializeIdle(core: u32, name: *i8, stack: u32, size: u32) {
+    let process = &mut processes[core as usize];
+    process.state = ProcessState::Ready;
+    process.name = name;
+    process.core = core;
+    process.last_core = core;
+    process.page_table = 0;
+    process.group = core;
+    process.members = 1;
+    SetStack(core, stack, size);
 }
 
 fn Spawn(name: *i8, entry: ProcessEntry, argument: u32) -> u32 {
@@ -182,7 +519,7 @@ fn SpawnWithStack(name: *i8, entry: ProcessEntry, argument: u32, mut stack_size:
 
     stack_size = (stack_size + 7) & !7u32;
     let interrupts = DisableInterrupts();
-    let mut id: u32 = 1;
+    let mut id = FIRST_PROCESS;
 
     while id < MAX_PROCESSES && processes[id as usize].state != ProcessState::Free && processes[id as usize].state != ProcessState::Crashed {
         id += 1;
@@ -227,7 +564,16 @@ fn SpawnWithStack(name: *i8, entry: ProcessEntry, argument: u32, mut stack_size:
     process.child_status = null;
     process.page_table = 0;
     process.heap_hint = USER_HEAP_START;
+    process.core = NO_CORE;
+    process.last_core = NO_CORE;
+    process.kill_pending = false;
+    process.group = id;
+    process.members = 1;
+    process.ending = false;
+    process.user_stack = 0;
+    process.futex_timed = false;
     process.state = ProcessState::Ready;
+    WakeIdleCores();
     RestoreInterrupts(interrupts);
     id
 }
@@ -272,7 +618,7 @@ fn GetCommandLine(buffer: *mut i8, capacity: usize) -> usize {
         return 0;
     }
 
-    let source = &processes[current_process as usize].arguments[0] as *i8;
+    let source = &processes[GroupOf(CurrentProcess()) as usize].arguments[0] as *i8;
     let mut i: usize = 0;
 
     while i + 1 < capacity && source[i] != '\0' {
@@ -307,8 +653,7 @@ fn WakeJoiningProcesses(child: u32, error: u32, status: i32) {
 
 fn ExitProcess() {
     DisableInterrupts();
-    WakeJoiningProcesses(current_process, FILE_OK, 0);
-    ReleaseProcess(current_process, true);
+    EndGroup(CurrentProcess(), FILE_OK, 0, true);
     Yield();
 }
 
@@ -330,7 +675,7 @@ fn ForegroundProcesses() -> u32 {
 }
 
 fn Kill(id: u32) -> bool {
-    if id == 0 || id == current_process || id >= MAX_PROCESSES {
+    if id >= MAX_PROCESSES || IsIdle(id) || GroupOf(id) == GroupOf(CurrentProcess()) {
         return false;
     }
 
@@ -338,8 +683,7 @@ fn Kill(id: u32) -> bool {
     let killed = processes[id as usize].state != ProcessState::Free;
 
     if killed {
-        WakeJoiningProcesses(id, FILE_KILLED, 0);
-        ReleaseProcess(id, false);
+        EndGroup(id, FILE_KILLED, 0, false);
     }
 
     RestoreInterrupts(interrupts);
@@ -348,7 +692,7 @@ fn Kill(id: u32) -> bool {
 
 fn Sleep(milliseconds: u32) {
     let interrupts = DisableInterrupts();
-    let process = &mut processes[current_process as usize];
+    let process = &mut processes[CurrentProcess() as usize];
     process.wake_tick = ticks + (milliseconds + MILLISECONDS_PER_TICK - 1) / MILLISECONDS_PER_TICK;
     process.state = ProcessState::Sleeping;
     Yield();
@@ -356,7 +700,7 @@ fn Sleep(milliseconds: u32) {
 }
 
 fn WaitForInput() {
-    processes[current_process as usize].state = ProcessState::Waiting;
+    processes[CurrentProcess() as usize].state = ProcessState::Waiting;
     Yield();
 }
 
@@ -366,8 +710,9 @@ fn WakeSleepingProcesses() {
     while id < MAX_PROCESSES {
         let process = &mut processes[id as usize];
 
-        if process.state == ProcessState::Sleeping && ((ticks - process.wake_tick) as i32) >= 0 {
+        if (process.state == ProcessState::Sleeping || (process.state == ProcessState::Blocked && process.futex_timed)) && ((ticks - process.wake_tick) as i32) >= 0 {
             process.state = ProcessState::Ready;
+            WakeIdleCores();
         }
 
         id += 1;
@@ -396,18 +741,19 @@ fn WakeWaitingProcesses() -> u32 {
 }
 
 fn SaveContext(frame: *mut Frame) {
-    let process = &mut processes[current_process as usize];
+    let process = &mut processes[CurrentProcess() as usize];
     process.frame = frame;
+    process.core = NO_CORE;
 
     if process.state != ProcessState::Free && process.state != ProcessState::Crashed && *(process.stack_bottom as *u32) != STACK_CANARY {
         process.state = ProcessState::Crashed;
-        WakeJoiningProcesses(current_process, FILE_CRASHED, 0);
+        WakeJoiningProcesses(CurrentProcess(), FILE_CRASHED, 0);
     }
 }
 
 fn SwitchTo(frame: *mut Frame, id: u32) -> *mut Frame {
     SaveContext(frame);
-    current_process = id;
+    SetCurrentProcess(id);
     ActivateProcess(id);
     processes[id as usize].frame
 }
@@ -415,22 +761,25 @@ fn SwitchTo(frame: *mut Frame, id: u32) -> *mut Frame {
 @nomangle
 fn Schedule(frame: *mut Frame) -> *mut Frame {
     SaveContext(frame);
-    let mut id = current_process;
+    let mut id = CurrentProcess();
+    let yield_kernel = OtherCoreWaiting();
     let mut i: u32 = 0;
 
     while i < MAX_PROCESSES {
         id = (id + 1) % MAX_PROCESSES;
+        let process = &processes[id as usize];
 
-        if id != 0 && processes[id as usize].state == ProcessState::Ready {
-            current_process = id;
+        if !IsIdle(id) && process.state == ProcessState::Ready && process.core == NO_CORE && (!yield_kernel || IsUserProcess(id)) {
+            SetCurrentProcess(id);
             ActivateProcess(id);
-            return processes[id as usize].frame;
+            return process.frame;
         }
 
         i += 1;
     }
 
-    current_process = 0;
-    ActivateProcess(0);
-    processes[0].frame
+    let idle = ReadCoreID();
+    SetCurrentProcess(idle);
+    ActivateProcess(idle);
+    processes[idle as usize].frame
 }

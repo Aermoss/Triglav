@@ -21,6 +21,7 @@ const PROCESS_NAME_LENGTH: usize = 32;
 const PROCESS_BRAM_STACK: u32 = 1;
 const PROCESS_USER: u32 = 2;
 const PROCESS_CURRENT: u32 = 4;
+const PROCESS_THREAD: u32 = 8;
 
 const SYSTEM_FILE_SYSTEM: u32 = 1;
 const SYSTEM_BLOCK_ADDRESSING: u32 = 2;
@@ -89,7 +90,7 @@ fn SpawnFile(path: *i8, command_line: *i8, result: *mut u32) -> u32 {
 }
 
 fn KillProcess(id: u32) -> u32 {
-    if id == 0 || id == current_process || id == init_process || id >= MAX_PROCESSES {
+    if id >= MAX_PROCESSES || IsIdle(id) || GroupOf(id) == GroupOf(CurrentProcess()) || GroupOf(id) == init_process {
         return FILE_NOT_ALLOWED;
     }
 
@@ -119,8 +120,12 @@ fn ListProcesses(buffer: *mut ProcessRecord, capacity: u32, count: *mut u32) -> 
                     record.flags |= PROCESS_USER;
                 }
 
-                if id == current_process {
+                if process.core != NO_CORE {
                     record.flags |= PROCESS_CURRENT;
+                }
+
+                if IsThread(id) {
+                    record.flags |= PROCESS_THREAD;
                 }
 
                 record.stack_bottom = process.stack_bottom;
