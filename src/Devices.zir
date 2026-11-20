@@ -16,7 +16,7 @@
 
 #[include "src/UART.zir" : *]
 
-const CLK_FREQ: u32 = 54000000;
+const CLK_FREQ: u32 = 81000000;
 
 const UART_DATA: u32 = 0xFFFF;
 const UART_STATUS: u32 = 0xFFFC;

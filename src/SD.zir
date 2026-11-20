@@ -61,7 +61,7 @@ fn SDWaitReady(timeout: u32) -> bool {
 }
 
 fn SDCommand(index: u32, argument: u32, crc: u32) -> u32 {
-    if index != 0 && !SDWaitReady(SD_WRITE_TIMEOUT) {
+    if index != 0 && index != 12 && !SDWaitReady(SD_WRITE_TIMEOUT) {
         return 0xFF;
     }
 
@@ -166,6 +166,15 @@ fn SDReadCapacity() -> u32 {
     if block_length < 9 { 0 } else { (size + 1) << (multiplier + 2 + block_length - 9) }
 }
 
+fn SDDrain() {
+    let mut i: u32 = 0;
+
+    while i < 255 {
+        SDTransfer(0xFF);
+        i += 1;
+    }
+}
+
 fn SDInitialize() -> bool {
     sd_ready = false;
     sd_port = MakeSPIPort(SD_SPI_BASE);
@@ -179,12 +188,20 @@ fn SDInitialize() -> bool {
     }
 
     SDSelect();
+    SDTransfer(0xFD);
+    SDWaitReady(SD_WRITE_TIMEOUT);
+    SDCommand(12, 0, 0xFF);
+    SDWaitReady(SD_WRITE_TIMEOUT);
     let mut response: u32 = 0xFF;
     i = 0;
 
     while i < 10 && response != 1 {
         response = SDCommand(0, 0, 0x95);
         i += 1;
+
+        if response != 1 {
+            SDDrain();
+        }
     }
 
     if response != 1 {

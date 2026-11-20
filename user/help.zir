@@ -33,6 +33,7 @@ fn Main(args: &mut Vector<String>) -> i32 {
     WriteLine("ls [path]                show a folder, quote paths with spaces");
     WriteLine("cat <file>               print a file");
     WriteLine("write <file> <text>      write the text into a file");
+    WriteLine("edit [file]              edit a text file, ^O saves and ^X exits");
     WriteLine("mkdir <path>             make a folder");
     WriteLine("cd [path]                go into a folder, or to the root");
     WriteLine("pwd                      show the current folder");

@@ -78,6 +78,7 @@ enum SystemCall: u32 {
     FutexWait = 40,
     FutexWake = 41,
     ProcessorCount = 42,
+    ConsolePending = 43,
     Unknown = 0xFFFFFFFF
 }
 
@@ -429,6 +430,9 @@ fn HandleTrap(cause: TrapCause, frame: *mut Frame) -> *mut Frame {
                 },
                 SystemCall::ProcessorCount => {
                     frame->a0 = OnlineCores();
+                },
+                SystemCall::ConsolePending => {
+                    frame->a0 = HasCharacter() as u32;
                 },
                 _ => {
                     frame->a0 = 0xFFFFFFFF;

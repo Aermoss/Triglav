@@ -1,0 +1,846 @@
+/*
+ * Copyright 2022-2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/file", "Common/System.zir" : *]
+
+const SYSTEM_CONSOLE_READ: u32 = 3;
+const SYSTEM_SLEEP: u32 = 10;
+const SYSTEM_CONSOLE_PENDING: u32 = 43;
+const UNKNOWN_CALL: u32 = 0xFFFFFFFF;
+
+const KEY_UP: u32 = 0x100;
+const KEY_DOWN: u32 = 0x101;
+const KEY_LEFT: u32 = 0x102;
+const KEY_RIGHT: u32 = 0x103;
+const KEY_HOME: u32 = 0x104;
+const KEY_END: u32 = 0x105;
+const KEY_PAGE_UP: u32 = 0x106;
+const KEY_PAGE_DOWN: u32 = 0x107;
+const KEY_DELETE: u32 = 0x108;
+const KEY_ESCAPE: u32 = 0x109;
+const KEY_NONE: u32 = 0x10A;
+
+const KEY_LINE_START: u32 = 0x01;
+const KEY_LINE_END: u32 = 0x05;
+const KEY_FIND_NEXT: u32 = 0x06;
+const KEY_GO_TO: u32 = 0x07;
+const KEY_BACKSPACE: u32 = 0x08;
+const KEY_TAB: u32 = 0x09;
+const KEY_LINE_FEED: u32 = 0x0A;
+const KEY_CUT: u32 = 0x0B;
+const KEY_REDRAW: u32 = 0x0C;
+const KEY_ENTER: u32 = 0x0D;
+const KEY_WRITE_OUT: u32 = 0x0F;
+const KEY_QUIT: u32 = 0x11;
+const KEY_SAVE: u32 = 0x13;
+const KEY_PASTE: u32 = 0x15;
+const KEY_FIND: u32 = 0x17;
+const KEY_EXIT: u32 = 0x18;
+const KEY_RUBOUT: u32 = 0x7F;
+
+const TAB_WIDTH: usize = 4;
+const SCREEN_ROWS: usize = 30;
+const SCREEN_COLUMNS: usize = 80;
+const DEFAULT_ROWS: usize = 24;
+const DEFAULT_COLUMNS: usize = 80;
+const MINIMUM_ROWS: usize = 4;
+const MINIMUM_COLUMNS: usize = 20;
+const ESCAPE_WAIT: u32 = 50;
+const REPLY_WAIT: u32 = 300;
+const POLL_INTERVAL: u32 = 10;
+
+const HELP_TEXT: *i8 = "^O Save  ^X Exit  ^K Cut  ^U Paste  ^W Find  ^F Next  ^G Go to line  ^L Redraw";
+
+fn ReadCharacter() -> i8 {
+    let mut character: i8 = 0;
+    let mut count: u32 = 0;
+
+    while count != 1 {
+        volatile asm : a7(SYSTEM_CONSOLE_READ), a0(&mut character as *mut i8), a1(1) -> {
+            ecall
+        } -> a0(count) : memory;
+    }
+
+    character
+}
+
+fn PendingCall() -> u32 {
+    let mut result: u32 = 0;
+
+    volatile asm : a7(SYSTEM_CONSOLE_PENDING) -> {
+        ecall
+    } -> a0(result) : memory;
+
+    result
+}
+
+fn Pending() -> bool {
+    PendingCall() == 1
+}
+
+fn Sleep(milliseconds: u32) {
+    volatile asm : a7(SYSTEM_SLEEP), a0(milliseconds) -> {
+        ecall
+    } : memory;
+}
+
+fn WaitForInput(milliseconds: u32) -> bool {
+    let mut waited: u32 = 0;
+
+    while !Pending() {
+        if waited >= milliseconds {
+            return false;
+        }
+
+        Sleep(POLL_INTERVAL);
+        waited += POLL_INTERVAL;
+    }
+
+    true
+}
+
+fn ReadKey() -> u32 {
+    let character = ReadCharacter();
+
+    if character != '\x1B' {
+        return character as u8 as u32;
+    }
+
+    if !WaitForInput(ESCAPE_WAIT) {
+        return KEY_ESCAPE;
+    }
+
+    let kind = ReadCharacter();
+
+    if kind != '[' && kind != 'O' {
+        return KEY_NONE;
+    }
+
+    let mut number: u32 = 0;
+    let mut first = true;
+    let mut code = ReadCharacter();
+
+    while (code >= '0' && code <= '9') || code == ';' {
+        if code == ';' {
+            first = false;
+        } else if first {
+            number = number * 10 + (code - '0') as u32;
+        }
+
+        code = ReadCharacter();
+    }
+
+    if code == 'A' {
+        KEY_UP
+    } else if code == 'B' {
+        KEY_DOWN
+    } else if code == 'C' {
+        KEY_RIGHT
+    } else if code == 'D' {
+        KEY_LEFT
+    } else if code == 'H' || (code == '~' && (number == 1 || number == 7)) {
+        KEY_HOME
+    } else if code == 'F' || (code == '~' && (number == 4 || number == 8)) {
+        KEY_END
+    } else if code == '~' && number == 3 {
+        KEY_DELETE
+    } else if code == '~' && number == 5 {
+        KEY_PAGE_UP
+    } else if code == '~' && number == 6 {
+        KEY_PAGE_DOWN
+    } else {
+        KEY_NONE
+    }
+}
+
+fn ReplyCharacter() -> i8 {
+    if WaitForInput(REPLY_WAIT) { ReadCharacter() } else { '\0' }
+}
+
+fn Limit(value: usize, low: usize, high: usize) -> usize {
+    if value < low { low } else if value > high { high } else { value }
+}
+
+fn QuerySize() -> (usize, usize) {
+    Write("\x1B[999;999H\x1B[6n");
+
+    if ReplyCharacter() != '\x1B' || ReplyCharacter() != '[' {
+        return (DEFAULT_ROWS, DEFAULT_COLUMNS);
+    }
+
+    let (mut height, mut width, mut second): (usize, usize, bool) = (0, 0, false);
+
+    loop {
+        let character = ReplyCharacter();
+
+        if character >= '0' && character <= '9' {
+            let digit = (character - '0') as usize;
+
+            if second {
+                width = width * 10 + digit;
+            } else {
+                height = height * 10 + digit;
+            }
+        } else if character == ';' {
+            second = true;
+        } else if character == 'R' {
+            break;
+        } else {
+            return (DEFAULT_ROWS, DEFAULT_COLUMNS);
+        }
+    }
+
+    (Limit(height, MINIMUM_ROWS, SCREEN_ROWS), Limit(width, MINIMUM_COLUMNS, SCREEN_COLUMNS))
+}
+
+fn IsContinuation(character: i8) -> bool {
+    ((character as u8) & 0xC0) == 0x80
+}
+
+fn SequenceLength(character: i8) -> usize {
+    let value = character as u8;
+    if value >= 0xF0 && value < 0xF8 { 4 } else if value >= 0xE0 && value < 0xF0 { 3 } else if value >= 0xC0 && value < 0xE0 { 2 } else { 1 }
+}
+
+fn ReadSequence(key: u32) -> String {
+    let lead = key as u8 as i8;
+    let size = SequenceLength(lead);
+    let mut bytes = lead.ToString();
+
+    while bytes.Length() < size {
+        let next = ReadCharacter();
+
+        if !IsContinuation(next) {
+            return String();
+        }
+
+        bytes += next;
+    }
+
+    bytes
+}
+
+fn NextIndex(line: &String, index: usize) -> usize {
+    let mut i = index + 1;
+
+    while i < line.Length() && IsContinuation(line[i]) {
+        i += 1;
+    }
+
+    i
+}
+
+fn PreviousIndex(line: &String, index: usize) -> usize {
+    let mut i = index - 1;
+
+    while i > 0 && IsContinuation(line[i]) {
+        i -= 1;
+    }
+
+    i
+}
+
+fn Advance(column: usize, character: i8) -> usize {
+    if character == '\t' {
+        (column / TAB_WIDTH + 1) * TAB_WIDTH
+    } else if IsContinuation(character) {
+        column
+    } else {
+        column + 1
+    }
+}
+
+fn ColumnOf(line: &String, index: usize) -> usize {
+    let mut column: usize = 0;
+
+    for i in 0..index {
+        column = Advance(column, line[i]);
+    }
+
+    column
+}
+
+fn IndexAt(line: &String, column: usize) -> usize {
+    let (mut i, mut current): (usize, usize) = (0, 0);
+
+    while i < line.Length() {
+        let next = Advance(current, line[i]);
+
+        if next > column {
+            break;
+        }
+
+        current = next;
+        i = NextIndex(line, i);
+    }
+
+    i
+}
+
+fn Width(text: &String) -> usize {
+    ColumnOf(text, text.Length())
+}
+
+fn Visible(line: &String, left: usize, width: usize) -> String {
+    let mut text = String();
+    let (mut i, mut column): (usize, usize) = (0, 0);
+
+    while i < line.Length() && column < left + width {
+        let next = NextIndex(line, i);
+        let character = line[i];
+        let next_column = Advance(column, character);
+
+        if character == '\t' {
+            for position in column..next_column {
+                if position >= left && position < left + width {
+                    text += ' ';
+                }
+            }
+        } else if column >= left {
+            if (character as u8) < 0x20 || character == '\x7F' {
+                text += '?';
+            } else {
+                text += line.SubString(i, next - i);
+            }
+        }
+
+        column = next_column;
+        i = next;
+    }
+
+    text
+}
+
+fn Indentation(line: &String, limit: usize) -> String {
+    let mut i: usize = 0;
+
+    while i < limit && (line[i] == ' ' || line[i] == '\t') {
+        i += 1;
+    }
+
+    line.SubString(0, i)
+}
+
+fn Number(value: usize) -> String {
+    String::FromInteger(value as u32)
+}
+
+class Editor {
+    lines: Vector<String>,
+    cut: Vector<String>,
+    shown: Vector<String>,
+    path: String,
+    message: String,
+    query: String,
+    rows: usize = DEFAULT_ROWS,
+    columns: usize = DEFAULT_COLUMNS,
+    row: usize = 0,
+    index: usize = 0,
+    wanted: usize = 0,
+    top: usize = 0,
+    left: usize = 0,
+    last: u32 = 0,
+    modified: bool = false,
+    cutting: bool = false,
+    trailing: bool = true,
+    crlf: bool = false,
+    prompting: bool = false,
+    running: bool = true;
+
+    Editor(&mut this) {}
+
+    fn Load(&mut this, path: &String) -> bool {
+        this.path = String(path);
+
+        match File::ReadText(path) {
+            Result<String, IOError>::Ok(text) => {
+                this.crlf = text.Contains("\r\n");
+                let clean = if this.crlf { text.Replace("\r\n", "\n") } else { String(text) };
+                this.trailing = clean.Empty() || clean.EndsWith('\n');
+                this.lines = clean.Split('\n');
+                true
+            },
+            Result<String, IOError>::Err(error) => {
+                match error {
+                    IOError::NotFound => {
+                        this.message = "New file.".ToString();
+                        true
+                    },
+                    _ => {
+                        WriteLine(path + ": " + ErrorMessage(error));
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    fn Text(&this) -> String {
+        let newline = if this.crlf { "\r\n" } else { "\n" };
+        let mut text = String();
+
+        for i in 0..this.lines.Length() {
+            if i > 0 {
+                text += newline;
+            }
+
+            text += this.lines[i];
+        }
+
+        if this.trailing && (this.lines.Length() > 1 || !this.lines[0].Empty()) {
+            text += newline;
+        }
+
+        text
+    }
+
+    fn Save(&mut this) -> bool {
+        if this.path.Empty() {
+            match this.Prompt("File name: ") {
+                Option<String>::Some(name) => {
+                    if name.Empty() {
+                        this.message = "Not saved.".ToString();
+                        return false;
+                    }
+
+                    this.path = name;
+                },
+                Option<String>::None => {
+                    return false;
+                }
+            }
+        }
+
+        if let Result<(), IOError>::Err(error) = File::WriteText(this.path, this.Text()) {
+            this.message = "Could not save: ".ToString() + ErrorMessage(error);
+            return false;
+        }
+
+        this.modified = false;
+        this.message = "Wrote ".ToString() + Number(this.lines.Length()) + (if this.lines.Length() == 1 { " line." } else { " lines." });
+        true
+    }
+
+    fn Resize(&mut this) {
+        let (rows, columns) = QuerySize();
+        (this.rows, this.columns) = (rows, columns);
+        this.shown.Clear();
+
+        for _ in 0..this.rows {
+            this.shown.PushBack("\x01".ToString());
+        }
+
+        Write("\x1B[0m\x1B[2J");
+    }
+
+    fn TextRows(&this) -> usize {
+        this.rows - 2
+    }
+
+    fn Column(&this) -> usize {
+        ColumnOf(this.lines[this.row], this.index)
+    }
+
+    fn Scroll(&mut this) {
+        let height = this.TextRows();
+        let column = this.Column();
+
+        if this.row < this.top {
+            this.top = this.row;
+        } else if this.row >= this.top + height {
+            this.top = this.row + 1 - height;
+        }
+
+        if column < this.left {
+            this.left = column;
+        } else if column >= this.left + this.columns {
+            this.left = column + 1 - this.columns;
+        }
+    }
+
+    fn StatusText(&this) -> String {
+        let name = if this.path.Empty() { "new file".ToString() } else { String(this.path) };
+        let left = " ".ToString() + name + (if this.modified { " (modified)" } else { "" });
+        let right = "line ".ToString() + Number(this.row + 1) + "/" + Number(this.lines.Length()) + ", column " + Number(this.Column() + 1) + " ";
+        let used = Width(left) + Width(right);
+        let text = if used < this.columns { left + " " * (this.columns - used) + right } else { left + "  " + right };
+        let visible = Visible(text, 0, this.columns);
+        visible + " " * (this.columns - Width(visible))
+    }
+
+    fn RowText(&this, screen_row: usize) -> String {
+        let height = this.TextRows();
+
+        if screen_row < height {
+            let line = this.top + screen_row;
+
+            if line >= this.lines.Length() {
+                return "\x1B[K".ToString();
+            }
+
+            let text = Visible(this.lines[line], this.left, this.columns);
+            return if Width(text) < this.columns { text + "\x1B[K" } else { text };
+        }
+
+        if screen_row == height {
+            return "\x1B[7m" + this.StatusText() + "\x1B[0m";
+        }
+
+        let bottom = if this.message.Empty() { HELP_TEXT.ToString() } else { String(this.message) };
+        Visible(bottom, 0, this.columns - 1) + "\x1B[K"
+    }
+
+    fn Draw(&mut this) {
+        this.Scroll();
+        let mut output = String();
+
+        for screen_row in 0..this.rows {
+            let text = this.RowText(screen_row);
+
+            if !(this.shown[screen_row] == text) {
+                output += "\x1B[" + Number(screen_row + 1) + "H" + text;
+                this.shown[screen_row] = text;
+            }
+        }
+
+        let (cursor_row, cursor_column) = if this.prompting {
+            (this.rows, Limit(Width(this.message) + 1, 1, this.columns - 1))
+        } else {
+            (this.row - this.top + 1, this.Column() - this.left + 1)
+        };
+
+        output += "\x1B[" + Number(cursor_row) + ";" + Number(cursor_column) + "H";
+        Write(output);
+    }
+
+    fn Prompt(&mut this, label: *i8) -> Option<String> {
+        let mut input = String();
+        this.prompting = true;
+
+        loop {
+            this.message = label.ToString() + input;
+            this.Draw();
+            let key = ReadKey();
+
+            if key == KEY_ENTER || key == KEY_LINE_FEED {
+                this.prompting = false;
+                this.message = String();
+                return Option<String>::Some(input);
+            }
+
+            if key == KEY_ESCAPE || key == KEY_EXIT || key == KEY_QUIT {
+                this.prompting = false;
+                this.message = "Cancelled.".ToString();
+                return Option<String>::None;
+            }
+
+            if (key == KEY_BACKSPACE || key == KEY_RUBOUT) && !input.Empty() {
+                input = input.SubString(0, PreviousIndex(input, input.Length()));
+            } else if key >= 0x20 && key < 0x7F {
+                input += key as i8;
+            } else if key >= 0xC0 && key < 0xF8 {
+                input += ReadSequence(key);
+            }
+        }
+
+        Option<String>::None
+    }
+
+    fn Ask(&mut this, question: *i8) -> u32 {
+        this.message = question.ToString();
+        this.prompting = true;
+        this.Draw();
+        let key = ReadKey();
+        this.prompting = false;
+        this.message = String();
+        key
+    }
+
+    fn Change(&mut this, line: String) {
+        this.lines[this.row] = line;
+        this.modified = true;
+    }
+
+    fn Insert(&mut this, text: &String) {
+        let line = String(this.lines[this.row]);
+        this.Change(line.SubString(0, this.index) + text + line.SubString(this.index));
+        this.index += text.Length();
+    }
+
+    fn Split(&mut this) {
+        let line = String(this.lines[this.row]);
+        let indentation = Indentation(line, this.index);
+        this.Change(line.SubString(0, this.index));
+        this.lines.Insert(this.row + 1, indentation + line.SubString(this.index));
+        this.row += 1;
+        this.index = indentation.Length();
+    }
+
+    fn Backspace(&mut this) {
+        if this.index > 0 {
+            let line = String(this.lines[this.row]);
+            let start = PreviousIndex(line, this.index);
+            this.Change(line.SubString(0, start) + line.SubString(this.index));
+            this.index = start;
+        } else if this.row > 0 {
+            let line = this.lines.RemoveAt(this.row);
+            this.row -= 1;
+            let previous = String(this.lines[this.row]);
+            this.index = previous.Length();
+            this.Change(previous + line);
+        }
+    }
+
+    fn Delete(&mut this) {
+        let line = String(this.lines[this.row]);
+
+        if this.index < line.Length() {
+            this.Change(line.SubString(0, this.index) + line.SubString(NextIndex(line, this.index)));
+        } else if this.row + 1 < this.lines.Length() {
+            let next = this.lines.RemoveAt(this.row + 1);
+            this.Change(line + next);
+        }
+    }
+
+    fn Cut(&mut this) {
+        if !this.cutting {
+            this.cut.Clear();
+        }
+
+        if this.lines.Length() == 1 {
+            this.cut.PushBack(String(this.lines[0]));
+            this.Change(String());
+        } else {
+            this.cut.PushBack(this.lines.RemoveAt(this.row));
+            this.modified = true;
+
+            if this.row >= this.lines.Length() {
+                this.row = this.lines.Length() - 1;
+            }
+        }
+
+        this.index = 0;
+    }
+
+    fn Paste(&mut this) {
+        if this.cut.Empty() {
+            this.message = "Nothing to paste.".ToString();
+            return;
+        }
+
+        for line in this.cut {
+            this.lines.Insert(this.row, String(line));
+            this.row += 1;
+        }
+
+        this.index = 0;
+        this.modified = true;
+    }
+
+    fn Search(&mut this) -> bool {
+        let count = this.lines.Length();
+
+        for step in 0..(count + 1) {
+            let line = (this.row + step) % count;
+            let start = if step == 0 { this.index + 1 } else { 0 };
+
+            if start <= this.lines[line].Length() {
+                if let Option<usize>::Some(found) = this.lines[line].SubString(start).Find(this.query) {
+                    this.row = line;
+                    this.index = start + found;
+                    return true;
+                }
+            }
+        }
+
+        this.message = "\"".ToString() + this.query + "\" was not found.";
+        false
+    }
+
+    fn Find(&mut this, ask: bool) {
+        if ask || this.query.Empty() {
+            match this.Prompt("Find: ") {
+                Option<String>::Some(text) => {
+                    if !text.Empty() {
+                        this.query = text;
+                    }
+                },
+                Option<String>::None => {
+                    return;
+                }
+            }
+        }
+
+        if !this.query.Empty() {
+            this.Search();
+        }
+    }
+
+    fn GoTo(&mut this) {
+        if let Option<String>::Some(text) = this.Prompt("Go to line: ") {
+            if let Option<u32>::Some(number) = text.Strip().ToUnsignedInteger() {
+                this.row = Limit(number as usize, 1, this.lines.Length()) - 1;
+                this.index = 0;
+            } else {
+                this.message = "That is not a line number.".ToString();
+            }
+        }
+    }
+
+    fn Exit(&mut this) {
+        if this.modified {
+            let key = this.Ask("Save the changes? (y)es, (n)o, Esc to go back");
+
+            if key == 'y' as u32 || key == 'Y' as u32 {
+                if !this.Save() {
+                    return;
+                }
+            } else if key != 'n' as u32 && key != 'N' as u32 {
+                return;
+            }
+        }
+
+        this.running = false;
+    }
+
+    fn Move(&mut this, key: u32) {
+        let height = this.TextRows();
+        let length = this.lines[this.row].Length();
+
+        if key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN {
+            if key == KEY_UP && this.row > 0 {
+                this.row -= 1;
+            } else if key == KEY_DOWN && this.row + 1 < this.lines.Length() {
+                this.row += 1;
+            } else if key == KEY_PAGE_UP {
+                this.row -= if this.row < height - 1 { this.row } else { height - 1 };
+            } else if key == KEY_PAGE_DOWN {
+                this.row = Limit(this.row + height - 1, 0, this.lines.Length() - 1);
+            }
+
+            this.index = IndexAt(this.lines[this.row], this.wanted);
+            return;
+        }
+
+        if key == KEY_LEFT {
+            if this.index > 0 {
+                this.index = PreviousIndex(this.lines[this.row], this.index);
+            } else if this.row > 0 {
+                this.row -= 1;
+                this.index = this.lines[this.row].Length();
+            }
+        } else if key == KEY_RIGHT {
+            if this.index < length {
+                this.index = NextIndex(this.lines[this.row], this.index);
+            } else if this.row + 1 < this.lines.Length() {
+                this.row += 1;
+                this.index = 0;
+            }
+        } else if key == KEY_HOME || key == KEY_LINE_START {
+            this.index = 0;
+        } else if key == KEY_END || key == KEY_LINE_END {
+            this.index = length;
+        }
+
+        this.wanted = this.Column();
+    }
+
+    fn Handle(&mut this, key: u32) {
+        let vertical = key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN;
+
+        if key != KEY_NONE {
+            this.message = String();
+        }
+
+        if key == KEY_EXIT || key == KEY_QUIT {
+            this.Exit();
+        } else if key == KEY_SAVE || key == KEY_WRITE_OUT {
+            this.Save();
+        } else if key == KEY_CUT {
+            this.Cut();
+        } else if key == KEY_PASTE {
+            this.Paste();
+        } else if key == KEY_FIND {
+            this.Find(true);
+        } else if key == KEY_FIND_NEXT {
+            this.Find(false);
+        } else if key == KEY_GO_TO {
+            this.GoTo();
+        } else if key == KEY_REDRAW {
+            this.Resize();
+        } else if vertical || key == KEY_LEFT || key == KEY_RIGHT || key == KEY_HOME || key == KEY_END || key == KEY_LINE_START || key == KEY_LINE_END {
+            this.Move(key);
+        } else if key == KEY_ENTER || (key == KEY_LINE_FEED && this.last != KEY_ENTER) {
+            this.Split();
+        } else if key == KEY_BACKSPACE || key == KEY_RUBOUT {
+            this.Backspace();
+        } else if key == KEY_DELETE {
+            this.Delete();
+        } else if key == KEY_TAB {
+            this.Insert(" " * (TAB_WIDTH - this.Column() % TAB_WIDTH));
+        } else if key >= 0x20 && key < 0x7F {
+            this.Insert((key as i8).ToString());
+        } else if key >= 0xC0 && key < 0xF8 {
+            this.Insert(ReadSequence(key));
+        }
+
+        if !vertical {
+            this.wanted = this.Column();
+        }
+
+        this.cutting = key == KEY_CUT;
+        this.last = key;
+    }
+
+    pub fn Run(&mut this, args: &Vector<String>) -> i32 {
+        if args.Length() > 2 {
+            WriteLine("Usage: edit [file]");
+            return 1;
+        }
+
+        if PendingCall() == UNKNOWN_CALL {
+            WriteLine("edit needs a newer Triglav kernel.");
+            return 1;
+        }
+
+        if args.Length() == 2 && !this.Load(args[1]) {
+            return 1;
+        }
+
+        if this.lines.Empty() {
+            this.lines.PushBack(String());
+        }
+
+        this.Resize();
+
+        while this.running {
+            this.Draw();
+            this.Handle(ReadKey());
+
+            while this.running && Pending() {
+                this.Handle(ReadKey());
+            }
+        }
+
+        Write("\x1B[0m\x1B[2J\x1B[H");
+        0
+    }
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    let mut editor = Editor();
+    editor.Run(args)
+}

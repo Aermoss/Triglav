@@ -24,6 +24,7 @@ const SCREEN_ROWS: u32 = 30;
 const CURSOR_ON: u32 = 0x8000;
 
 const DEFAULT_ATTRIBUTE: u32 = 0x07;
+const REVERSE_ATTRIBUTE: u32 = 0x70;
 
 const ESCAPE_NONE: u32 = 0;
 const ESCAPE_STARTED: u32 = 1;
@@ -35,6 +36,8 @@ static mut screen_scroll: u32 = 0;
 static mut screen_attribute: u32 = DEFAULT_ATTRIBUTE;
 static mut escape_state: u32 = ESCAPE_NONE;
 static mut escape_parameter: u32 = 0;
+static mut escape_first: u32 = 0;
+static mut escape_separated: bool = false;
 static mut utf8_code: u32 = 0;
 static mut utf8_remaining: u32 = 0;
 
@@ -89,21 +92,43 @@ fn NewLine() {
     ClearRow(SCREEN_ROWS - 1, 0);
 }
 
+fn ScreenPosition(value: u32, limit: u32) -> u32 {
+    if value == 0 { 0 } else if value > limit { limit - 1 } else { value - 1 }
+}
+
+fn SetAttribute(value: u32) {
+    if value == 0 {
+        screen_attribute = DEFAULT_ATTRIBUTE;
+    } else if value == 7 {
+        screen_attribute = REVERSE_ATTRIBUTE;
+    }
+}
+
 fn HandleEscape(character: i8) {
     if escape_state == ESCAPE_STARTED {
         escape_state = if character == '[' { ESCAPE_SEQUENCE } else { ESCAPE_NONE };
-        escape_parameter = 0;
+        (escape_parameter, escape_first, escape_separated) = (0, 0, false);
     } else if character >= '0' && character <= '9' {
         escape_parameter = escape_parameter * 10 + (character - '0') as u32;
-    } else if character != ';' {
+    } else if character == ';' {
+        (escape_first, escape_parameter, escape_separated) = (escape_parameter, 0, true);
+    } else if character != '?' {
         escape_state = ESCAPE_NONE;
+        let first = if escape_separated { escape_first } else { escape_parameter };
+        let second = if escape_separated { escape_parameter } else { 0 };
 
-        if character == 'J' && escape_parameter == 2 {
+        if character == 'J' && first == 2 {
             ClearScreen();
-        } else if character == 'H' {
-            (screen_row, screen_column) = (0, 0);
+        } else if character == 'H' || character == 'f' {
+            (screen_row, screen_column) = (ScreenPosition(first, SCREEN_ROWS), ScreenPosition(second, SCREEN_COLUMNS));
         } else if character == 'K' {
             ClearRow(screen_row, screen_column);
+        } else if character == 'm' {
+            SetAttribute(first);
+
+            if escape_separated {
+                SetAttribute(second);
+            }
         }
     }
 }
